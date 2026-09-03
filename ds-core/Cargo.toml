@@ -1,0 +1,16 @@
+[package]
+name = "ds-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+pbkdf2.workspace = true
+subtle.workspace = true
+zeroize.workspace = true
+getrandom.workspace = true

@@ -1,0 +1,9 @@
+[package]
+name = "ds-erase"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+ds-core = { path = "../ds-core" }

@@ -1,0 +1,34 @@
+# Config schema example. This is the shape dsctl reads and writes at
+# /etc/arxos/deathstroke/deathstroke.conf. It is a reference; nothing reads this .example file.
+# dsctl owns the real file. It never stores the duress code, only a salted hash, which lives in the
+# state dir, not here. File mode is 0700 root:root (dsctl enforces).
+
+# armed: is the tool active? When false, nothing is in the auth path and no trigger can fire.
+# Only `dsctl arm` sets true (and inserts the PAM line at that moment); `dsctl disarm` reverses it.
+armed = false
+
+# trigger surface. All opt-in, all default off.
+trigger.duress_password = false   # a code at the unlock/login prompt. Never grants a session.
+trigger.panic_command   = false   # the panic command.
+trigger.hotkey_chord    = false   # an armed hotkey chord.
+trigger.tamper_usb      = false   # unexpected new USB mass-storage while armed.
+
+# duress secret: stored as a hash only, in the state dir, never here, never plaintext.
+#   /var/lib/arxos/deathstroke/duress.hash  =  pbkdf2_sha256$<iter>$<salt_hex>$<hash_hex>
+# these two lines only record the scheme and params for verification, never the code.
+duress.kdf = pbkdf2-sha256
+duress.iterations = 600000
+
+# recovery keyslot metadata. The key itself is never stored; the user holds it.
+#   dsctl enroll-recovery adds a LUKS keyslot via `cryptsetup luksAddKey`.
+recovery.keyslot = -1             # -1 = not enrolled. Set to the LUKS slot index once enrolled.
+recovery.device  = ""             # the LUKS device the recovery slot was added to.
+
+# crypto-erase behaviour. The fast path is key destruction.
+erase.mode = lukserase           # lukserase (all slots) | killslot (in-use slot only)
+erase.destroy_header_backups = true   # a header backup defeats luksErase, so find and destroy it.
+erase.zero_ram_masterkey = true
+
+# self-removal on fire: remove the tool's own artifacts (PAM line, hashes, this config) as an early
+# phase, so a completed run leaves no trace that a duress setup existed on the imaged drive.
+onfire.remove_artifacts = true

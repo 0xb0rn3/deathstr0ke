@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = ["ds-core", "dsctl", "ds-erase"]
+# pam_ds (the PAM cdylib) joins the workspace once its module logic is implemented.
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "proprietary"
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# RustCrypto primitives, so there is no hand-rolled crypto.
+sha2 = "0.10"
+hmac = "0.12"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+subtle = "2"            # constant-time comparison
+zeroize = "1"          # scrub secrets from memory
+getrandom = "0.2"      # OS CSPRNG for the salt
