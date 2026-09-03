@@ -105,6 +105,78 @@ pub struct State {
     pub recovery_device: Option<String>,
 }
 
+// ---- authentication-attempt policy (3-strikes-then-wipe; DEATHSTROKE.md §11.F) ----
+//
+// A CONSECUTIVE wrong-password counter, persisted so it survives a reboot/power-cycle (an attacker
+// must not reset it by rebooting). It is reset on ANY successful auth, so a legitimate fat-finger
+// followed by a success clears it and only sustained failure (an attacker) escalates.
+//   at `lockout_at` consecutive failures  -> lock out for a cooldown + show the wipe WARNING
+//   at `wipe_at`    consecutive failures  -> fire the crypto-erase
+// Thresholds are configurable; defaults below. The counter file is one line: "count last_fail_unix".
+
+pub const DEFAULT_LOCKOUT_AT: u32 = 3;   // lockout + wipe warning
+pub const DEFAULT_WIPE_AT: u32 = 5;      // continued failures past the warning -> wipe
+pub const DEFAULT_COOLDOWN_SECS: u64 = 300;
+
+pub fn attempts_path() -> String { format!("{}/attempts", state_dir()) }
+
+/// The persisted attempt state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Attempts { pub count: u32, pub last_fail: u64 }
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Read the counter (missing/garbage => zero, a clean start).
+pub fn read_attempts() -> Attempts {
+    match std::fs::read_to_string(attempts_path()) {
+        Ok(s) => {
+            let mut it = s.split_whitespace();
+            let count = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+            let last_fail = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+            Attempts { count, last_fail }
+        }
+        Err(_) => Attempts::default(),
+    }
+}
+
+fn write_attempts(a: Attempts) -> Result<()> {
+    let path = attempts_path();
+    if let Some(dir) = std::path::Path::new(&path).parent() { let _ = std::fs::create_dir_all(dir); }
+    std::fs::write(&path, format!("{} {}\n", a.count, a.last_fail)).with_context(|| format!("write {path}"))?;
+    if let Ok(f) = std::fs::File::open(&path) { let _ = f.sync_all(); }  // survive a power cut
+    Ok(())
+}
+
+/// Record one consecutive failure; returns the new count. fsync'd so a power cut cannot lose it.
+pub fn record_failure() -> Result<u32> {
+    let mut a = read_attempts();
+    a.count = a.count.saturating_add(1);
+    a.last_fail = now_secs();
+    write_attempts(a)?;
+    Ok(a.count)
+}
+
+/// Reset the counter (call on ANY successful auth).
+pub fn reset_attempts() {
+    let _ = std::fs::remove_file(attempts_path());
+}
+
+/// Seconds of lockout remaining, if currently locked out (count >= lockout_at and within cooldown).
+pub fn lockout_remaining(lockout_at: u32, cooldown: u64) -> Option<u64> {
+    let a = read_attempts();
+    if a.count < lockout_at { return None; }
+    let elapsed = now_secs().saturating_sub(a.last_fail);
+    if elapsed < cooldown { Some(cooldown - elapsed) } else { None }
+}
+
+/// Whether the current count means we should fire the wipe.
+pub fn should_wipe(count: u32, wipe_at: u32) -> bool { count >= wipe_at }
+
+/// Whether this failure is the one that first crosses the lockout line (=> show the wipe warning).
+pub fn crossed_lockout(count: u32, lockout_at: u32) -> bool { count >= lockout_at }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,5 +214,40 @@ mod tests {
         // password="password", salt="salt", c=1, dkLen=32.
         let out = pbkdf2_sha256(b"password", b"salt", 1).unwrap();
         assert_eq!(hex(&out), "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b");
+    }
+
+    #[test]
+    fn attempt_counter_increments_resets_locks_and_wipes() {
+        // isolate the counter file to a temp dir via DS_STATE_DIR so the test never touches real state.
+        let dir = format!("/tmp/ds-core-attempts.{}", std::process::id());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("DS_STATE_DIR", &dir);
+        reset_attempts();
+
+        assert_eq!(read_attempts().count, 0, "starts at zero");
+        assert_eq!(record_failure().unwrap(), 1);
+        assert_eq!(record_failure().unwrap(), 2, "consecutive failures accumulate");
+        // not yet locked out at 2 with a threshold of 3
+        assert!(lockout_remaining(DEFAULT_LOCKOUT_AT, DEFAULT_COOLDOWN_SECS).is_none());
+        let c3 = record_failure().unwrap();
+        assert_eq!(c3, 3);
+        assert!(crossed_lockout(c3, DEFAULT_LOCKOUT_AT), "3rd failure crosses the lockout line (warn)");
+        assert!(!should_wipe(c3, DEFAULT_WIPE_AT), "3 is lockout+warn, not yet wipe");
+        // now locked out within the cooldown window
+        assert!(lockout_remaining(DEFAULT_LOCKOUT_AT, DEFAULT_COOLDOWN_SECS).is_some());
+        // a success resets everything
+        reset_attempts();
+        assert_eq!(read_attempts().count, 0, "any success clears the counter");
+        assert!(lockout_remaining(DEFAULT_LOCKOUT_AT, DEFAULT_COOLDOWN_SECS).is_none());
+        // continued failures reach the wipe threshold
+        let mut last = 0;
+        for _ in 0..DEFAULT_WIPE_AT { last = record_failure().unwrap(); }
+        assert_eq!(last, DEFAULT_WIPE_AT);
+        assert!(should_wipe(last, DEFAULT_WIPE_AT), "reaching wipe_at means fire the wipe");
+        // an expired cooldown is no longer a lockout (cooldown of 0 seconds)
+        assert!(lockout_remaining(DEFAULT_LOCKOUT_AT, 0).is_none(), "past the cooldown, not locked");
+
+        std::env::remove_var("DS_STATE_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -184,15 +184,33 @@ fn arm() -> Result<()> {
     let content = std::fs::read_to_string(SYSTEM_AUTH).with_context(|| format!("read {SYSTEM_AUTH}"))?;
     if content.contains(ARM_MARKER) { println!("dsctl: already armed."); return Ok(()); }
     std::fs::copy(SYSTEM_AUTH, format!("{SYSTEM_AUTH}.deathstr0ke.bak")).context("backup system-auth")?;
-    let line = format!("auth      [success=ignore ignore=ignore default=die]     {PAM_MODULE}   # {ARM_MARKER}\n");
-    // insert before the first existing `auth` line so it runs first; fall back to prepending.
-    let new = match content.lines().position(|l| l.trim_start().starts_with("auth")) {
-        Some(i) => { let mut v: Vec<String> = content.lines().map(String::from).collect(); v.insert(i, line.trim_end().to_string()); v.join("\n") + "\n" }
-        None => format!("{line}{content}"),
-    };
-    write_atomic(SYSTEM_AUTH, &new)?;
+
+    // A faillock-style 3-line stack so we can tell a wrong password (a real failure, seen only AFTER
+    // pam_unix rejects it) from a right one:
+    //   PREAUTH (first): enforce a lockout + detect the duress code. IGNORE lets the stack proceed;
+    //                    a duress match / active lockout returns AUTH_ERR (default=die -> fail).
+    //   AUTHFAIL (after pam_unix, failure path only): count the consecutive failure + escalate.
+    //   AUTHSUCC (after a success): reset the counter.
+    let preauth  = format!("auth      [success=ignore ignore=ignore default=die]     {PAM_MODULE}                # {ARM_MARKER}");
+    let authfail = format!("auth      [default=die]                                  {PAM_MODULE}   authfail     # {ARM_MARKER}");
+    let authsucc = format!("auth      sufficient                                     {PAM_MODULE}   authsucc     # {ARM_MARKER}");
+
+    let mut v: Vec<String> = content.lines().map(String::from).collect();
+    // preauth goes before the first auth line (runs first); authfail/authsucc go after the LAST auth
+    // line (so they run after pam_unix has decided).
+    let first_auth = v.iter().position(|l| l.trim_start().starts_with("auth"));
+    let last_auth = v.iter().rposition(|l| l.trim_start().starts_with("auth"));
+    match (first_auth, last_auth) {
+        (Some(fa), Some(la)) => {
+            v.insert(la + 1, authsucc);
+            v.insert(la + 1, authfail);
+            v.insert(fa, preauth);
+        }
+        _ => { v.insert(0, authsucc); v.insert(0, authfail); v.insert(0, preauth); }
+    }
+    write_atomic(SYSTEM_AUTH, &(v.join("\n") + "\n"))?;
     enable_resume_unit()?;
-    println!("dsctl: armed. Duress code is live at the auth prompt; boot-resume enabled.");
+    println!("dsctl: armed. Duress code + attempt-limit are live at every PAM surface; boot-resume enabled.");
     Ok(())
 }
 
