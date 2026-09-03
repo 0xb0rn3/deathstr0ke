@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["ds-core", "dsctl", "ds-erase", "pam_ds"]
+members = ["ds-core", "dsctl", "ds-erase", "pam_ds", "ds-unlock"]
 
 [workspace.package]
 version = "0.0.1"

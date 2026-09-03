@@ -1,0 +1,13 @@
+[package]
+name = "ds-unlock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ds-unlock"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+ds-core = { path = "../ds-core" }
