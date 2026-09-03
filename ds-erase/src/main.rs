@@ -68,6 +68,13 @@ fn journal_dir(journal: &str) -> String {
     Path::new(journal).parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| "/boot".into())
 }
 
+/// The pre-configured device to erase on a duress trigger (dsctl records the LUKS root here). Read from
+/// the state dir so `ds-erase --fire` with no arguments (as pam_ds calls it) knows what to destroy.
+fn configured_target() -> Option<String> {
+    std::fs::read_to_string(format!("{}/target.device", ds_core::state_dir())).ok()
+        .map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
 fn write_journal(path: &str, contents: &str) -> Result<()> {
     if let Some(dir) = Path::new(path).parent() { let _ = std::fs::create_dir_all(dir); }
     let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
@@ -118,7 +125,10 @@ fn shred_file(path: &Path) -> bool {
 
 fn fire(args: &[String]) -> Result<()> {
     guard()?;   // refuses outside a machine marked disposable
-    let device = flag(args, "--device").context("--fire needs --device <dev>")?;
+    // The target device: --device wins; otherwise the configured target (state/target.device). This is
+    // what lets pam_ds fire `ds-erase --fire` with no arguments -- it reads the pre-configured root.
+    let device = flag(args, "--device").or_else(configured_target)
+        .context("--fire needs --device <dev> or a configured target.device")?;
     let mode = flag(args, "--mode").unwrap_or_else(|| "erase".into());
     let journal = flag(args, "--journal").unwrap_or_else(|| DEFAULT_JOURNAL.into());
 

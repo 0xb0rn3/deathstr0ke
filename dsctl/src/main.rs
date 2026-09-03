@@ -58,9 +58,12 @@ fn enroll_recovery(args: &[String]) -> Result<()> {
         .args(["luksAddKey", &device, &newkey, "--key-file", &existing])
         .status().context("cryptsetup luksAddKey")?;
     if !st.success() { bail!("luksAddKey failed on {device}"); }
-    // record the device in state so status/erase know the target (metadata only, never the key).
+    // record the device in state (metadata only, never the key). recovery.device documents where the
+    // recovery slot lives; target.device is what ds-erase destroys on a duress trigger (the same LUKS
+    // root), so pam_ds can fire `ds-erase --fire` with no arguments.
     let _ = std::fs::write(format!("{}/recovery.device", ds_core::state_dir()), &device);
-    println!("dsctl: recovery keyslot enrolled on {device}.");
+    let _ = std::fs::write(format!("{}/target.device", ds_core::state_dir()), &device);
+    println!("dsctl: recovery keyslot enrolled on {device} (erase target set).");
     Ok(())
 }
 
