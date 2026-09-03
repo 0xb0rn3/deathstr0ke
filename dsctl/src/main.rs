@@ -31,9 +31,11 @@ fn run(args: Vec<String>) -> Result<()> {
         Some("verify")     => verify(args.get(1).map(String::as_str)),
         Some("status")     => status(),
         Some("enroll-recovery") => enroll_recovery(&args),
+        Some("factors")    => factors(),
+        Some("enroll")     => enroll_factor(&args),
         Some("arm")        => arm(),
         Some("disarm")     => disarm(),
-        _ => { eprintln!("usage: dsctl set-duress | verify [code] | status | enroll-recovery --device <dev> | arm | disarm"); std::process::exit(2); }
+        _ => { eprintln!("usage: dsctl set-duress | verify [code] | status | factors | enroll <fido2|tpm2|passphrase> --device <dev> [--pin] | enroll-recovery --device <dev> | arm | disarm"); std::process::exit(2); }
     }
 }
 
@@ -43,6 +45,67 @@ const SYSTEM_AUTH: &str = "/etc/pam.d/system-auth";
 const ARM_MARKER: &str = "deathstr0ke-arm";
 const RESUME_UNIT_SRC: &str = "/usr/lib/arxos/deathstroke/deathstroke-resume.service.disabled";
 const RESUME_UNIT_DST: &str = "/etc/systemd/system/deathstroke-resume.service";
+
+// ---- factor menu: detect hardware + enroll unlock factors via systemd-cryptenroll ----
+
+/// Detect which unlock factors the machine supports, so the installer / Control Center only offers what
+/// the hardware can do (DEATHSTROKE.md §12.1). Non-destructive, read-only.
+fn factors() -> Result<()> {
+    let tpm2 = Path::new("/dev/tpmrm0").exists() || Path::new("/dev/tpm0").exists();
+    // a FIDO2 hidraw device is the practical signal; systemd-cryptenroll needs libfido2 too.
+    let fido2 = Command::new("sh").arg("-c")
+        .arg("systemd-cryptenroll --fido2-device=list 2>/dev/null | grep -qiE '/dev|token' && echo y")
+        .output().map(|o| o.stdout.starts_with(b"y")).unwrap_or(false);
+    let cryptenroll = Path::new("/usr/bin/systemd-cryptenroll").exists();
+    println!("supported unlock factors");
+    println!("  passphrase     : yes  (always available; the knowledge fallback)");
+    println!("  fido2/yubikey  : {}", yesno(fido2));
+    println!("  tpm2           : {}", yesno(tpm2));
+    println!("  duress code    : yes  (dsctl set-duress)");
+    println!("  backup yubikey : {}  (enroll a second fido2 key; replaces a written recovery key)", yesno(fido2));
+    println!();
+    println!("  systemd-cryptenroll: {}", yesno(cryptenroll));
+    println!("  policy (recommended): passphrase + yubikey + backup yubikey + duress code");
+    if !fido2 { println!("  note: no FIDO2 token detected right now; plug the key in and re-run `dsctl factors`."); }
+    Ok(())
+}
+
+/// Enroll one unlock factor into a LUKS device via systemd-cryptenroll. Each factor is an independent
+/// keyslot, so factors coexist (add a YubiKey without removing the passphrase). Never removes the
+/// passphrase slot -- the knowledge fallback must always remain, so the user can never be bricked.
+fn enroll_factor(args: &[String]) -> Result<()> {
+    require_root()?;
+    guard_disposable("enroll")?;
+    let device = flag(args, "--device").context("enroll needs --device <luks-dev>")?;
+    let kind = args.get(1).map(String::as_str).unwrap_or("");
+    let pin = args.iter().any(|a| a == "--pin");   // require a PIN alongside the factor (MFA)
+    // systemd-cryptenroll needs an existing passphrase to authorise adding a slot; it prompts for it.
+    let mut ce = vec!["systemd-cryptenroll".to_string()];
+    match kind {
+        "fido2" => {
+            ce.push("--fido2-device=auto".into());
+            ce.push(format!("--fido2-with-client-pin={}", if pin { "yes" } else { "no" }));
+        }
+        "tpm2" => {
+            ce.push("--tpm2-device=auto".into());
+            // seal to measured-boot PCRs: firmware+secureboot (7), kernel/initramfs (4,8,9) -> the disk
+            // unlocks only on our unmodified boot chain (DEATHSTROKE.md §12.2 A).
+            ce.push("--tpm2-pcrs=0+2+4+7".into());
+            if pin { ce.push("--tpm2-with-pin=yes".into()); }
+        }
+        "passphrase" => ce.push("--password".into()),
+        _ => bail!("unknown factor '{kind}' (fido2 | tpm2 | passphrase)"),
+    }
+    ce.push(device.clone());
+    println!("dsctl: enrolling {kind}{} on {device} (passphrase slot is kept)",
+             if pin { " + PIN" } else { "" });
+    let st = Command::new(&ce[0]).args(&ce[1..]).status().context("systemd-cryptenroll")?;
+    if !st.success() { bail!("enroll {kind} failed"); }
+    // record the factor as enabled (metadata only; no secret).
+    let _ = std::fs::write(format!("{}/factor.{kind}", ds_core::state_dir()), "enrolled");
+    println!("dsctl: {kind} enrolled. Keep the passphrase + a backup factor so you are never locked out.");
+    Ok(())
+}
 
 /// Add a LUKS recovery keyslot so the user can always get back in after a keyslot destruction. Needs
 /// an existing passphrase to authorise the add (cryptsetup requirement). Destructive-adjacent, so it
