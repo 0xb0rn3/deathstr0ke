@@ -79,6 +79,18 @@ fn enroll_factor(args: &[String]) -> Result<()> {
     let device = flag(args, "--device").context("enroll needs --device <luks-dev>")?;
     let kind = args.get(1).map(String::as_str).unwrap_or("");
     let pin = args.iter().any(|a| a == "--pin");   // require a PIN alongside the factor (MFA)
+    let simulate = args.iter().any(|a| a == "--simulate");
+
+    // --simulate proves the KEYSLOT mechanics without USB hardware. A real FIDO2 token enrolls an
+    // HMAC-derived secret as a LUKS keyslot; here we derive that secret in software (from a stored
+    // per-device credential + salt) and enroll it as a keyfile keyslot, so the same "the token's secret
+    // unlocks the disk" property is exercised end to end. It does NOT exercise the physical USB
+    // handshake (that needs a real key, or the VM USB-HID sim). Only fido2 is simulated.
+    if simulate {
+        if kind != "fido2" { bail!("--simulate only applies to fido2"); }
+        return enroll_fido2_simulated(&device, flag(args, "--existing-keyfile"));
+    }
+
     // systemd-cryptenroll needs an existing passphrase to authorise adding a slot; it prompts for it.
     let mut ce = vec!["systemd-cryptenroll".to_string()];
     match kind {
@@ -104,6 +116,36 @@ fn enroll_factor(args: &[String]) -> Result<()> {
     // record the factor as enabled (metadata only; no secret).
     let _ = std::fs::write(format!("{}/factor.{kind}", ds_core::state_dir()), "enrolled");
     println!("dsctl: {kind} enrolled. Keep the passphrase + a backup factor so you are never locked out.");
+    Ok(())
+}
+
+/// Simulated FIDO2 enrollment: model the token as a per-device credential file (what a real token's
+/// non-extractable secret stands in for here) and enroll the secret it "returns" as a LUKS keyslot via
+/// `cryptsetup luksAddKey --key-file`. Proves that a token-derived secret becomes a working keyslot,
+/// without any USB hardware. --existing-keyfile authorises the add non-interactively (for the self-test).
+fn enroll_fido2_simulated(device: &str, existing_keyfile: Option<String>) -> Result<()> {
+    let dir = ds_core::state_dir();
+    // the "credential": a random 32-byte secret that a real token would hold non-extractably. We store
+    // it here ONLY because this is a simulation; a real token never exposes it.
+    let cred = format!("{dir}/fido2-sim.cred");
+    if !Path::new(&cred).exists() {
+        let mut buf = [0u8; 32];
+        getrandom::getrandom(&mut buf).map_err(|e| anyhow::anyhow!("csprng: {e}"))?;
+        std::fs::write(&cred, buf)?;
+        let _ = Command::new("chmod").args(["600", &cred]).status();
+    }
+    // the secret the "token" returns for this device = the keyslot's key material.
+    let keyfile = format!("{dir}/fido2-sim.key");
+    std::fs::copy(&cred, &keyfile)?;
+    let _ = Command::new("chmod").args(["600", &keyfile]).status();
+
+    let mut a = vec!["luksAddKey".to_string(), device.to_string(), keyfile.clone()];
+    if let Some(ek) = existing_keyfile { a.push("--key-file".into()); a.push(ek); }
+    let st = Command::new("cryptsetup").args(&a).status().context("cryptsetup luksAddKey (sim)")?;
+    if !st.success() { bail!("simulated fido2 luksAddKey failed"); }
+    let _ = std::fs::write(format!("{dir}/factor.fido2"), "enrolled (simulated)");
+    println!("dsctl: fido2 (SIMULATED) enrolled on {device}. The token secret now unlocks a keyslot.");
+    println!("       (physical USB handshake unproven in sim; verify with a real key or the VM USB-HID sim.)");
     Ok(())
 }
 

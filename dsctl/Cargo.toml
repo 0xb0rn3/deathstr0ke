@@ -8,3 +8,4 @@ license.workspace = true
 anyhow.workspace = true
 ds-core = { path = "../ds-core" }
 zeroize.workspace = true
+getrandom.workspace = true
