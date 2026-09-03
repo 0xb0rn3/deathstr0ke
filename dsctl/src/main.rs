@@ -33,6 +33,8 @@ fn run(args: Vec<String>) -> Result<()> {
         Some("enroll-recovery") => enroll_recovery(&args),
         Some("factors")    => factors(),
         Some("enroll")     => enroll_factor(&args),
+        Some("harden")     => harden(&args),
+        Some("harden-check") => harden_check(),
         Some("arm")        => arm(),
         Some("disarm")     => disarm(),
         _ => { eprintln!("usage: dsctl set-duress | verify [code] | status | factors | enroll <fido2|tpm2|passphrase> --device <dev> [--pin] | enroll-recovery --device <dev> | arm | disarm"); std::process::exit(2); }
@@ -146,6 +148,77 @@ fn enroll_fido2_simulated(device: &str, existing_keyfile: Option<String>) -> Res
     let _ = std::fs::write(format!("{dir}/factor.fido2"), "enrolled (simulated)");
     println!("dsctl: fido2 (SIMULATED) enrolled on {device}. The token secret now unlocks a keyslot.");
     println!("       (physical USB handshake unproven in sim; verify with a real key or the VM USB-HID sim.)");
+    Ok(())
+}
+
+/// The configured erase/LUKS target device (written by enroll-recovery), if any.
+fn configured_target() -> Option<String> {
+    std::fs::read_to_string(format!("{}/target.device", ds_core::state_dir())).ok()
+        .map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+// ---- offline hardening: strong LUKS KDF + anti-forensic posture (DEATHSTROKE.md §12.2/§10.1) ----
+//
+// This is the layer that actually resists an OFFLINE attacker (who images the disk and never runs our
+// initramfs/greeter, so the attempt-limit does not touch them). Two parts:
+//   - crank the LUKS Argon2id KDF cost so brute-forcing the passphrase offline is expensive;
+//   - set the kernel/swap posture so keys cannot be scavenged (init_on_free, no plaintext swap/hibernate).
+
+/// Audit the offline-hardening posture (read-only, safe anywhere).
+fn harden_check() -> Result<()> {
+    println!("offline-hardening audit");
+    // LUKS KDF of the configured target device (if any).
+    if let Some(dev) = configured_target() {
+        let dump = Command::new("cryptsetup").args(["luksDump", &dev]).output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+        let pbkdf = dump.lines().find(|l| l.trim_start().starts_with("PBKDF:")).map(|l| l.trim()).unwrap_or("PBKDF: ?");
+        let mem = dump.lines().find(|l| l.trim_start().starts_with("Memory:")).map(|l| l.trim()).unwrap_or("Memory: ?");
+        println!("  LUKS device       : {dev}");
+        println!("  {pbkdf}  ({})", if pbkdf.contains("argon2id") { "argon2id: good" } else { "not argon2id: weak vs offline GPU" });
+        println!("  {mem}");
+    } else {
+        println!("  LUKS device       : (none configured; run enroll-recovery first)");
+    }
+    // kernel key-scavenging posture. init_on_free zeroes freed memory so a LUKS key can't be scavenged
+    // from the slab; it is a boot-param / CONFIG_INIT_ON_FREE_DEFAULT_ON setting (no writable sysfs).
+    let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    let iof = if cmdline.contains("init_on_free=1") { "on (cmdline): good" }
+              else if cmdline.contains("init_on_free=0") { "OFF (cmdline): freed key memory not zeroed" }
+              else { "not on cmdline (relies on CONFIG_INIT_ON_FREE_DEFAULT_ON; add init_on_free=1 to be sure)" };
+    println!("  init_on_free      : {iof}");
+    println!("  hibernation       : {}", if Path::new("/sys/power/disk").exists() && std::fs::read_to_string("/sys/power/disk").map(|s| s.contains("[disabled]")).unwrap_or(false) { "disabled: good" } else { "check: a swsusp image can leak the key unless swap is encrypted/off" });
+    // swap: any active swap that is not on a dm-crypt device is a plaintext-key hole.
+    let swaps = std::fs::read_to_string("/proc/swaps").unwrap_or_default();
+    let plain_swap = swaps.lines().skip(1).any(|l| { let dev = l.split_whitespace().next().unwrap_or(""); !dev.is_empty() && !dev.contains("dm-") && !dev.contains("zram") });
+    println!("  swap              : {}", if swaps.lines().count() <= 1 { "none active: good".into() } else if plain_swap { "PLAINTEXT swap active: keys can leak to disk".to_string() } else { "encrypted/zram only: good".into() });
+    Ok(())
+}
+
+/// Apply the offline hardening: re-PBKDF the LUKS keyslots to a strong Argon2id cost, and write the
+/// kernel/swap posture recommendations. Argon2 re-key is destructive-adjacent (rewrites keyslots), so
+/// it is guarded to a disposable machine while under development.
+fn harden(args: &[String]) -> Result<()> {
+    require_root()?;
+    guard_disposable("harden")?;
+    let device = flag(args, "--device").or_else(configured_target)
+        .context("harden needs --device <dev> or a configured target")?;
+    // Argon2id cost: memory (KiB) + iterations. Defaults are strong-but-bootable; tune per hardware.
+    let mem_kib = flag(args, "--argon-mem").unwrap_or_else(|| "1048576".into());   // 1 GiB
+    let iter_ms = flag(args, "--argon-time").unwrap_or_else(|| "2000".into());     // 2s target
+    println!("dsctl: raising LUKS KDF to argon2id (mem {mem_kib} KiB, ~{iter_ms} ms) on {device}");
+    // cryptsetup luksConvertKey re-derives an existing keyslot with the new KDF. Needs the passphrase.
+    let st = Command::new("cryptsetup")
+        .args(["luksConvertKey", "--pbkdf", "argon2id", "--pbkdf-memory", &mem_kib,
+               "--iter-time", &iter_ms, &device])
+        .status().context("cryptsetup luksConvertKey")?;
+    if !st.success() { bail!("luksConvertKey failed (wrong passphrase, or already at this KDF)"); }
+    // record the recommended kernel posture for the installer/kernel config to enforce.
+    let dir = ds_core::state_dir();
+    let _ = std::fs::write(format!("{dir}/harden.recommend"),
+        "kernel_cmdline: init_on_free=1 init_on_alloc=1 slab_nomerge lockdown=confidentiality\n\
+         hibernation: disabled (or encrypted swap with a random per-boot key)\n\
+         swap: none, zram, or dm-crypt only (never plaintext)\n");
+    println!("dsctl: KDF hardened. Kernel/swap posture written to {dir}/harden.recommend (audit with `dsctl harden-check`).");
     Ok(())
 }
 
