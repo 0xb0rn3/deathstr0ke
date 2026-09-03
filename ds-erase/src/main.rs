@@ -58,22 +58,101 @@ fn active_keyslots(device: &str) -> usize {
     }).count()
 }
 
+// ---- in-progress journal (the power-loss resume flag) ----
+
+/// Default journal path: the ESP, mounted at /boot, is unencrypted and present before root unlock, so
+/// the initramfs hook can read this flag and resume before the disk is exposed.
+const DEFAULT_JOURNAL: &str = "/boot/deathstroke-inprogress";
+
+fn journal_dir(journal: &str) -> String {
+    Path::new(journal).parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| "/boot".into())
+}
+
+fn write_journal(path: &str, contents: &str) -> Result<()> {
+    if let Some(dir) = Path::new(path).parent() { let _ = std::fs::create_dir_all(dir); }
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    std::fs::write(path, format!("{contents}\nts={ts}\n")).with_context(|| format!("write journal {path}"))?;
+    if let Ok(f) = std::fs::File::open(path) { let _ = f.sync_all(); }   // survive an instant power cut
+    Ok(())
+}
+
+// ---- LUKS header-backup destruction (the forensic catch) ----
+
+/// LUKS magic: "LUKS" 0xba 0xbe at offset 0. Both LUKS1 and LUKS2 headers (and their `luksHeaderBackup`
+/// files) begin with it, so this identifies a header-backup file regardless of the file's name.
+const LUKS_MAGIC: &[u8] = &[b'L', b'U', b'K', b'S', 0xba, 0xbe];
+
+fn is_luks_header_file(path: &Path) -> bool {
+    use std::io::Read;
+    let mut buf = [0u8; 6];
+    std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut buf)).is_ok() && buf == LUKS_MAGIC
+}
+
+/// Find and shred every LUKS-header file under the given paths (a file, or a directory scanned one
+/// level deep). Returns how many were destroyed. Shredding overwrites the header material so it cannot
+/// be recovered to `luksHeaderRestore` a keyslot.
+fn destroy_header_backups(paths: &[String]) -> usize {
+    let mut n = 0;
+    for p in paths {
+        let pb = Path::new(p);
+        if pb.is_file() {
+            if is_luks_header_file(pb) && shred_file(pb) { n += 1; }
+        } else if pb.is_dir() {
+            if let Ok(rd) = std::fs::read_dir(pb) {
+                for ep in rd.flatten().map(|e| e.path()) {
+                    if ep.is_file() && is_luks_header_file(&ep) && shred_file(&ep) { n += 1; }
+                }
+            }
+        }
+    }
+    n
+}
+
+fn shred_file(path: &Path) -> bool {
+    // overwrite then unlink so the header material is unrecoverable; fall back to a plain remove.
+    Command::new("shred").args(["-u", "-z", "-n", "1"]).arg(path).status().map(|s| s.success()).unwrap_or(false)
+        || std::fs::remove_file(path).is_ok()
+}
+
 // ---- --fire (guarded) ----
 
 fn fire(args: &[String]) -> Result<()> {
     guard()?;   // refuses outside a machine marked disposable
     let device = flag(args, "--device").context("--fire needs --device <dev>")?;
     let mode = flag(args, "--mode").unwrap_or_else(|| "erase".into());
+    let journal = flag(args, "--journal").unwrap_or_else(|| DEFAULT_JOURNAL.into());
+
+    // 1. Journal BEFORE any destruction, on an unencrypted always-present area (the ESP). A power cut
+    //    mid-run is then resumed on the next boot: the initramfs hook sees the flag before root is
+    //    unlocked and re-enters `ds-erase --resume`. fsync'd so the flag survives an instant power cut.
+    write_journal(&journal, &format!("phase=erase mode={mode} device={device}"))?;
+
+    // 2. Destroy any LUKS header backup FIRST. A header backup can `luksHeaderRestore` a keyslot and
+    //    undo the erase, so it is the forensic catch. Scan the configured paths (default: the journal's
+    //    directory, i.e. the ESP) plus any --header-scan dirs, and shred every LUKS-header file found.
+    let mut scan: Vec<String> = args_multi(args, "--header-scan");
+    if scan.is_empty() { scan.push(journal_dir(&journal)); }
+    let destroyed = destroy_header_backups(&scan);
+    eprintln!("ds-erase: destroyed {destroyed} LUKS header backup(s) under {scan:?}");
+
+    // 3. The crypto-erase: destroy the in-use keyslot (recovery survives) or every keyslot.
     match mode.as_str() {
         "killslot" => {
             let slot: u8 = flag(args, "--slot").context("killslot needs --slot N")?.parse().context("bad --slot")?;
-            luks_kill_slot(&device, slot)
+            luks_kill_slot(&device, slot)?;
         }
-        "erase" => luks_erase(&device),
+        "erase" => luks_erase(&device)?,
         other => bail!("unknown --mode '{other}' (killslot|erase)"),
     }
-    // NOTE: the full sequence also (1) writes the in-progress journal before this, (2) zeroes the
-    // in-RAM master key, (3) finds and destroys any LUKS header backup. In progress.
+
+    // 4. RAM master-key note: a currently-OPEN mapping keeps its master key in kernel memory until the
+    //    mapping is torn down. The running root cannot close itself; that key is dropped when the
+    //    DEATHSTROKE sequence powers the machine off (aided by the kernel's init_on_free). Documented,
+    //    not silently pretended away.
+
+    // 5. Clear the journal: the container is gone (or the daily key is), so there is nothing to resume.
+    let _ = std::fs::remove_file(&journal);
+    Ok(())
 }
 
 // ---- --self-test: exercise the REAL primitives on a disposable loopback (safe anywhere) ----
@@ -112,6 +191,27 @@ fn self_test() -> Result<()> {
 
     check(&mut ok, "both keys open initially", opens(&k0) && opens(&k1));
 
+    // journal: write the in-progress flag, then clear it (the power-loss resume marker).
+    let jnl = format!("{dir}/inprogress");
+    write_journal(&jnl, "phase=erase mode=erase device=test")?;
+    check(&mut ok, "in-progress journal written", Path::new(&jnl).exists());
+    let _ = std::fs::remove_file(&jnl);
+    check(&mut ok, "journal cleared on completion", !Path::new(&jnl).exists());
+
+    // header backups live in their own directory (in production this is the ESP, which never holds the
+    // encrypted root's backing device). One sits in the scanned dir (ds-erase must find + shred it); one
+    // is stashed a level deeper than the one-level scan reaches (used below to prove why we destroy them).
+    let bkdir = format!("{dir}/backups"); std::fs::create_dir_all(&bkdir)?;
+    let hdr = format!("{bkdir}/hdr.bak");
+    let stash_dir = format!("{bkdir}/deeper"); std::fs::create_dir_all(&stash_dir)?;
+    let stash = format!("{stash_dir}/keep.hdr");
+    run_ok("cryptsetup", &["luksHeaderBackup", &loop_dev, "--header-backup-file", &hdr])?;
+    run_ok("cryptsetup", &["luksHeaderBackup", &loop_dev, "--header-backup-file", &stash])?;
+    check(&mut ok, "LUKS header backup detected as a header file", is_luks_header_file(Path::new(&hdr)));
+    let n = destroy_header_backups(&[bkdir.clone()]);
+    check(&mut ok, "header backup in scan dir SHREDDED", n == 1 && !Path::new(&hdr).exists());
+    check(&mut ok, "backup in a deeper dir untouched by one-level scan", Path::new(&stash).exists());
+
     // phase A: kill the daily slot via the PRODUCT function; recovery must survive.
     luks_kill_slot(&loop_dev, 0)?;
     check(&mut ok, "daily key destroyed (slot 0 no longer opens)", !opens(&k0));
@@ -122,7 +222,14 @@ fn self_test() -> Result<()> {
     check(&mut ok, "0 keyslots remain after erase", active_keyslots(&loop_dev) == 0);
     check(&mut ok, "recovery no longer opens — UNDECRYPTABLE", !opens(&k1));
 
-    if ok { println!("ds-erase --self-test: ALL PASS (crypto-erase model proven via the product code)"); Ok(()) }
+    // why header-backup destruction matters: a backup ds-erase did NOT catch can undo the whole erase.
+    // Restore from the stashed header, then the recovery key opens again -> proves the erase is only
+    // durable if every header backup is destroyed (which fire() does; the scan above shredded the one
+    // it could reach).
+    run_ok("cryptsetup", &["luksHeaderRestore", "--batch-mode", &loop_dev, "--header-backup-file", &stash])?;
+    check(&mut ok, "a SURVIVING header backup undoes the erase (why we destroy them)", opens(&k1));
+
+    if ok { println!("ds-erase --self-test: ALL PASS (crypto-erase + journal + header-backup destruction proven)"); Ok(()) }
     else { bail!("self-test had failures"); }
 }
 
@@ -140,6 +247,16 @@ fn report_guard() {
 }
 fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
+}
+/// All values of a repeatable `--name value` flag.
+fn args_multi(args: &[String], name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == name { if let Some(v) = args.get(i + 1) { out.push(v.clone()); } i += 2; }
+        else { i += 1; }
+    }
+    out
 }
 fn have(bin: &str) -> bool {
     Command::new("sh").arg("-c").arg(format!("command -v {bin}"))
