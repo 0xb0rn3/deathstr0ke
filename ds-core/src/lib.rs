@@ -11,14 +11,19 @@ use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroize;
 
-/// Reserved on-disk locations (match the inert scaffold's install.sh layout).
+/// Reserved on-disk locations (match the install.sh layout).
 pub const CONFIG_DIR: &str = "/etc/arxos/deathstroke";
 pub const STATE_DIR: &str = "/var/lib/arxos/deathstroke";
 pub const LIB_DIR: &str = "/usr/lib/arxos/deathstroke";
 
-pub fn duress_hash_path() -> String { format!("{STATE_DIR}/duress.hash") }
-pub fn state_path() -> String { format!("{STATE_DIR}/STATE") }
-pub fn in_progress_path() -> String { format!("{STATE_DIR}/in-progress") }
+/// The state directory. `DS_STATE_DIR` overrides it, which keeps tests off the real system paths and
+/// lets an unprivileged harness exercise the same code. Production leaves it unset (the default).
+pub fn state_dir() -> String {
+    std::env::var("DS_STATE_DIR").unwrap_or_else(|_| STATE_DIR.to_string())
+}
+pub fn duress_hash_path() -> String { format!("{}/duress.hash", state_dir()) }
+pub fn state_path() -> String { format!("{}/STATE", state_dir()) }
+pub fn in_progress_path() -> String { format!("{}/in-progress", state_dir()) }
 
 /// KDF cost. 600k PBKDF2-HMAC-SHA256 iterations is the current OWASP-class floor; the value is stored
 /// alongside the hash so it can be raised later without invalidating existing enrollments.

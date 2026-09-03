@@ -1,0 +1,15 @@
+[package]
+name = "pam_ds"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "pam_ds"
+# a C-ABI shared object PAM can dlopen. The exported symbols are the only C boundary; the logic is Rust.
+crate-type = ["cdylib"]
+
+[dependencies]
+ds-core = { path = "../ds-core" }
+# the "libpam" feature exposes PamLibExt (get_authtok, etc.), which we link against libpam to use.
+pamsm = { version = "0.5", features = ["libpam"] }

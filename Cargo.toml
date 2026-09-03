@@ -1,7 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["ds-core", "dsctl", "ds-erase"]
-# pam_ds (the PAM cdylib) joins the workspace once its module logic is implemented.
+members = ["ds-core", "dsctl", "ds-erase", "pam_ds"]
 
 [workspace.package]
 version = "0.0.1"
