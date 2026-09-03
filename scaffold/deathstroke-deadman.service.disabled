@@ -1,0 +1,7 @@
+# Dormant template. Enabled alongside the timer when the dead-man switch is armed.
+[Unit]
+Description=DEATHSTROKE dead-man check (fires if the check-in window has expired)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/dsctl deadman-check

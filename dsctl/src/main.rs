@@ -35,6 +35,9 @@ fn run(args: Vec<String>) -> Result<()> {
         Some("enroll")     => enroll_factor(&args),
         Some("harden")     => harden(&args),
         Some("harden-check") => harden_check(),
+        Some("deadman")    => deadman(&args),
+        Some("checkin")    => checkin(),
+        Some("deadman-check") => { return deadman_check().map(|c| std::process::exit(c)); }
         Some("arm")        => arm(),
         Some("disarm")     => disarm(),
         _ => { eprintln!("usage: dsctl set-duress | verify [code] | status | factors | enroll <fido2|tpm2|passphrase> --device <dev> [--pin] | enroll-recovery --device <dev> | arm | disarm"); std::process::exit(2); }
@@ -149,6 +152,82 @@ fn enroll_fido2_simulated(device: &str, existing_keyfile: Option<String>) -> Res
     println!("dsctl: fido2 (SIMULATED) enrolled on {device}. The token secret now unlocks a keyslot.");
     println!("       (physical USB handshake unproven in sim; verify with a real key or the VM USB-HID sim.)");
     Ok(())
+}
+
+// ---- dead-man switch: auto-wipe if the user does not check in within a window (DEATHSTROKE.md §12.2 C) ----
+//
+// Defends the "seize it, isolate it, analyze it at leisure" case: if the machine is not re-authed /
+// checked in by a deadline, it wipes. State is a last-checkin timestamp + a window; a boot-time and
+// periodic check compares now-vs-deadline and fires ds-erase if overdue. `checkin` (run on any
+// successful login, or by the user) resets the clock.
+
+fn deadman_state() -> String { format!("{}/deadman", ds_core::state_dir()) }
+
+/// Configure/enable/disable the dead-man switch. `deadman <hours>` sets the window and checks in now;
+/// `deadman off` disables it. Non-destructive (writes state only).
+fn deadman(args: &[String]) -> Result<()> {
+    require_root()?;
+    match args.get(1).map(String::as_str) {
+        Some("off") | Some("disable") => {
+            let _ = std::fs::remove_file(deadman_state());
+            println!("dsctl: dead-man switch disabled.");
+        }
+        Some(h) => {
+            let hours: u64 = h.parse().context("deadman <hours> | off")?;
+            if hours == 0 { bail!("window must be > 0 hours"); }
+            std::fs::create_dir_all(ds_core::state_dir()).ok();
+            std::fs::write(deadman_state(), format!("window_secs={}\nlast_checkin={}\n", hours * 3600, now_unix()))?;
+            println!("dsctl: dead-man switch armed. Check in at least every {hours}h (dsctl checkin), or it wipes.");
+        }
+        None => {
+            // report status
+            match read_deadman() {
+                Some((win, last)) => {
+                    let due = last + win;
+                    let remain = due.saturating_sub(now_unix());
+                    println!("dead-man switch: ARMED, window {}h, {}h {}m until wipe (checkin to reset)",
+                             win / 3600, remain / 3600, (remain % 3600) / 60);
+                }
+                None => println!("dead-man switch: disabled"),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reset the dead-man clock (run on any successful login, or manually). Silent no-op if not armed.
+fn checkin() -> Result<()> {
+    require_root()?;
+    if let Some((win, _)) = read_deadman() {
+        std::fs::write(deadman_state(), format!("window_secs={win}\nlast_checkin={}\n", now_unix()))?;
+        println!("dsctl: checked in. Dead-man clock reset.");
+    }
+    Ok(())
+}
+
+/// The periodic/boot check: if armed AND overdue, fire the wipe. Called by a systemd timer + at boot.
+/// (Exposed as a hidden verb so the packaged timer can call `dsctl deadman-check`.)
+fn deadman_check() -> Result<i32> {
+    match read_deadman() {
+        Some((win, last)) if now_unix() > last + win => {
+            eprintln!("DEATHSTROKE: dead-man switch expired (no check-in). Destroying this system.");
+            let dev = configured_target().context("no target device configured")?;
+            let erase = ["/usr/lib/arxos/deathstroke/ds-erase", "/usr/local/bin/ds-erase", "ds-erase"]
+                .iter().find(|p| Path::new(p).exists()).unwrap_or(&"ds-erase").to_string();
+            let st = Command::new(erase).args(["--fire", "--device", &dev, "--mode", "erase"]).status();
+            Ok(if st.map(|s| s.success()).unwrap_or(false) { 2 } else { 1 })
+        }
+        _ => Ok(0),   // not armed or not overdue
+    }
+}
+
+fn read_deadman() -> Option<(u64, u64)> {
+    let s = std::fs::read_to_string(deadman_state()).ok()?;
+    let g = |k: &str| s.lines().find_map(|l| l.strip_prefix(k).and_then(|v| v.trim().trim_start_matches('=').trim().parse().ok()));
+    Some((g("window_secs")?, g("last_checkin")?))
+}
+fn now_unix() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 /// The configured erase/LUKS target device (written by enroll-recovery), if any.
