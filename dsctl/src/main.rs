@@ -35,6 +35,8 @@ fn run(args: Vec<String>) -> Result<()> {
         Some("enroll")     => enroll_factor(&args),
         Some("harden")     => harden(&args),
         Some("harden-check") => harden_check(),
+        Some("seal-tpm")   => seal_tpm(&args),
+        Some("tpm-check")  => tpm_check(),
         Some("deadman")    => deadman(&args),
         Some("checkin")    => checkin(),
         Some("deadman-check") => { return deadman_check().map(|c| std::process::exit(c)); }
@@ -151,6 +153,63 @@ fn enroll_fido2_simulated(device: &str, existing_keyfile: Option<String>) -> Res
     let _ = std::fs::write(format!("{dir}/factor.fido2"), "enrolled (simulated)");
     println!("dsctl: fido2 (SIMULATED) enrolled on {device}. The token secret now unlocks a keyslot.");
     println!("       (physical USB handshake unproven in sim; verify with a real key or the VM USB-HID sim.)");
+    Ok(())
+}
+
+// ---- TPM measured-boot seal (DEATHSTROKE.md §12.6) — the patch that makes everything real ----
+//
+// Seals a LUKS keyslot to the TPM bound to boot-chain PCRs, so the disk unlocks ONLY on our unmodified
+// boot. This forces an offline/foreign-boot adversary back onto our attempt-limited path (they cannot
+// boot a foreign kernel to skip the counter or edit the ESP without changing the PCRs and losing the
+// key). A PIN is required so mere possession of the powered-off machine does not unlock it. A non-TPM
+// factor (passphrase + backup FIDO2) is always kept so a TPM clear / mainboard swap never bricks the user.
+
+/// Read-only audit of TPM readiness + whether a TPM keyslot is enrolled.
+fn tpm_check() -> Result<()> {
+    let have_tpm = Path::new("/dev/tpmrm0").exists() || Path::new("/dev/tpm0").exists();
+    println!("TPM measured-boot readiness");
+    println!("  tpm device        : {}", yesno(have_tpm));
+    println!("  cryptenroll       : {}", yesno(Path::new("/usr/bin/systemd-cryptenroll").exists()));
+    // secure boot state (PCR 7 is only meaningful with Secure Boot on).
+    let sb = std::fs::read_dir("/sys/firmware/efi/efivars").ok()
+        .map(|rd| rd.flatten().any(|e| e.file_name().to_string_lossy().starts_with("SecureBoot-")))
+        .unwrap_or(false);
+    println!("  efi/secure-boot   : {}", if sb { "efivars present (check SB enabled for PCR7 to bind firmware trust)" } else { "no efivars (BIOS/CSM boot: PCR7 weak)" });
+    if let Some(dev) = configured_target() {
+        let dump = Command::new("cryptsetup").args(["luksDump", &dev]).output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+        let tpm = dump.contains("systemd-tpm2");
+        println!("  tpm keyslot on {dev}: {}", if tpm { "ENROLLED (measured-boot seal present)" } else { "not enrolled (run dsctl seal-tpm --device ...)" });
+    }
+    if !have_tpm { println!("  note: no TPM here; seal on a TPM-capable machine/VM. This is why the seal is a REQUIREMENT (DEATHSTROKE.md §12.6)."); }
+    Ok(())
+}
+
+/// Seal a LUKS keyslot to the TPM (measured boot). Keeps the passphrase slot. Guarded to a disposable
+/// machine while under development (it changes how the disk unlocks at boot).
+fn seal_tpm(args: &[String]) -> Result<()> {
+    require_root()?;
+    guard_disposable("seal-tpm")?;
+    if !(Path::new("/dev/tpmrm0").exists() || Path::new("/dev/tpm0").exists()) {
+        bail!("no TPM device (/dev/tpm*). Seal on a TPM-capable machine/VM.");
+    }
+    let device = flag(args, "--device").or_else(configured_target)
+        .context("seal-tpm needs --device <dev> or a configured target")?;
+    // PCRs: 0 firmware, 2 option ROMs, 4 boot loader+kernel, 7 secure-boot state. Bind to our exact boot.
+    let pcrs = flag(args, "--pcrs").unwrap_or_else(|| "0+2+4+7".into());
+    let with_pin = !args.iter().any(|a| a == "--no-pin");   // PIN on by default (possession alone must not unlock)
+    let mut ce = vec!["systemd-cryptenroll".to_string(), "--tpm2-device=auto".into(),
+                      format!("--tpm2-pcrs={pcrs}")];
+    ce.push(format!("--tpm2-with-pin={}", if with_pin { "yes" } else { "no" }));
+    // signed-policy form (optional): survives kernel/initramfs updates without re-enrolling.
+    if let Some(pk) = flag(args, "--public-key") { ce.push(format!("--tpm2-public-key={pk}")); }
+    ce.push(device.clone());
+    println!("dsctl: sealing a keyslot to the TPM on {device} (PCRs {pcrs}{})", if with_pin { ", PIN" } else { "" });
+    let st = Command::new(&ce[0]).args(&ce[1..]).status().context("systemd-cryptenroll tpm2")?;
+    if !st.success() { bail!("TPM seal failed"); }
+    let _ = std::fs::write(format!("{}/factor.tpm2", ds_core::state_dir()), format!("sealed pcrs={pcrs}"));
+    println!("dsctl: TPM measured-boot seal enrolled. The disk now unlocks only on this unmodified boot chain.");
+    println!("       Keep the passphrase + a backup factor: a TPM clear or mainboard change needs them.");
     Ok(())
 }
 

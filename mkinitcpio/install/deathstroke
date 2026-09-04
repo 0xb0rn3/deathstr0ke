@@ -1,0 +1,46 @@
+#!/bin/bash
+# mkinitcpio install hook: deathstr0ke pre-boot LUKS unlock manager.
+#
+# Bakes ds-unlock (+ ds-erase for the wipe path) and cryptsetup into the initramfs and installs the
+# runtime hook. Place `deathstroke` in HOOKS= BEFORE `encrypt`/`sd-encrypt`: ds-unlock opens the LUKS
+# device itself (DEATHSTROKE.md §11.F), so it must create the mapper before the stock encrypt hook
+# runs — encrypt then sees /dev/mapper/<name> already present and skips its own prompt.
+#
+# What it enforces at the boot passphrase: a duress phrase -> instant crypto-erase; the correct
+# passphrase -> unlock + reset the reboot-persistent counter; a wrong one -> increment (fsync to the
+# unencrypted ESP), warn at lockout_at, and at wipe_at fire ds-erase. Counter + duress verifier live
+# on the ESP because the encrypted root is unavailable pre-boot (honest limit: offline disk imaging
+# bypasses this layer — closed only by TPM-sealed measured boot, §12.2 A).
+
+build() {
+    # the pre-boot manager + the eraser it calls on a duress/limit trigger
+    add_binary /usr/bin/ds-unlock
+    add_binary /usr/bin/ds-erase
+    # crypto userspace + the kernel modules to open a LUKS2 volume
+    add_binary /usr/bin/cryptsetup
+    add_module 'dm-crypt'
+    add_module 'dm-mod'
+    map add_module 'nls_cp437' 'nls_iso8859-1' 'vfat'   # mount the FAT ESP for the counter/verifier
+    add_module 'af_alg' 'algif_skcipher' 'xts' 'aes_x86_64' 2>/dev/null || true
+
+    add_runscript
+}
+
+help() {
+    cat <<HELPEOF
+deathstr0ke pre-boot LUKS unlock manager.
+
+Enforces the DEATHSTROKE attempt-limit + duress policy at the boot passphrase prompt, using a
+reboot-persistent counter on the unencrypted ESP. Runs BEFORE the encrypt hook and opens the LUKS
+root itself. Reads cryptdevice= from the kernel cmdline (same syntax as the encrypt hook):
+
+    cryptdevice=UUID=<luks-uuid>:<mapname>
+
+A duress phrase wipes instantly; too many wrong attempts wipes; the correct phrase unlocks and
+clears the counter. List it in HOOKS before encrypt:
+
+    HOOKS=(... block deathstroke encrypt filesystems ...)
+HELPEOF
+}
+
+# vim: set ft=sh ts=4 sw=4 et:

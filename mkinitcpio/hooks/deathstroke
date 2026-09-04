@@ -1,0 +1,72 @@
+#!/usr/bin/ash
+# mkinitcpio runtime hook: deathstr0ke pre-boot LUKS unlock manager.
+# Runs in early userspace BEFORE the encrypt hook. Parses cryptdevice= like the stock encrypt hook,
+# mounts the unencrypted ESP (for the persistent counter + duress verifier), and hands off to
+# ds-unlock, which does the prompt/duress/attempt-limit and opens the LUKS device itself. On success
+# /dev/mapper/<name> exists, so a following encrypt hook detects it and skips its own prompt.
+
+run_hook() {
+    # only act when the cmdline actually asks for an encrypted root
+    [ -n "$cryptdevice" ] || return 0
+
+    # cryptdevice=device:dmname[:options]  (same grammar as the encrypt hook)
+    local cdev dmname
+    cdev="${cryptdevice%%:*}"
+    dmname="${cryptdevice#*:}"; dmname="${dmname%%:*}"
+    [ -n "$dmname" ] || dmname="cryptroot"
+
+    # resolve UUID=/PARTUUID=/LABEL= forms to a node (encrypt relies on udev having populated these)
+    local resolved
+    resolved="$(resolve_device "$cdev" 30)" || resolved="$cdev"
+
+    # already opened by a prior hook? nothing to do.
+    if [ -e "/dev/mapper/$dmname" ]; then
+        return 0
+    fi
+
+    # find + mount the ESP read-write (the counter must be updatable and fsync'd)
+    local esp_dev esp_mnt="/ds-esp"
+    esp_dev="$(find_esp)"
+    if [ -n "$esp_dev" ]; then
+        mkdir -p "$esp_mnt"
+        mount -t vfat -o rw "$esp_dev" "$esp_mnt" 2>/dev/null || mount "$esp_dev" "$esp_mnt" 2>/dev/null
+    fi
+
+    if [ ! -x /usr/bin/ds-unlock ]; then
+        # never leave the user stranded: fall through to the stock encrypt prompt
+        echo "deathstr0ke: ds-unlock missing, falling back to standard unlock"
+        return 0
+    fi
+
+    # hand off. ds-unlock prompts, enforces duress/attempt-limit against the ESP state, and on the
+    # correct passphrase runs `cryptsetup open <dev> <name>` itself.
+    ds-unlock --device "$resolved" --map-name "$dmname" --esp-dir "$esp_mnt/deathstroke"
+
+    # leave the ESP mounted for a resume check to update, but sync now so the counter is durable
+    sync
+}
+
+# Best-effort ESP locator: prefer the ARXOS-labelled EFI partition (set by the installer), then any
+# partition already carrying the deathstroke state dir, then the first FAT partition.
+find_esp() {
+    if [ -e /dev/disk/by-partlabel/ARXOS_EFI ]; then
+        echo /dev/disk/by-partlabel/ARXOS_EFI; return 0
+    fi
+    local d
+    for d in $(blkid -o device 2>/dev/null); do
+        case "$(blkid -o value -s TYPE "$d" 2>/dev/null)" in
+            vfat|msdos)
+                # a FAT with our state dir wins outright
+                if mount -t vfat -o ro "$d" /ds-probe 2>/dev/null; then
+                    if [ -d /ds-probe/deathstroke ]; then umount /ds-probe 2>/dev/null; echo "$d"; return 0; fi
+                    umount /ds-probe 2>/dev/null
+                fi
+                [ -z "$first_fat" ] && first_fat="$d"
+                ;;
+        esac
+    done
+    [ -n "$first_fat" ] && { echo "$first_fat"; return 0; }
+    return 1
+}
+
+# vim: set ft=sh ts=4 sw=4 et:
