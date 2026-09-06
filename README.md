@@ -8,7 +8,7 @@
 
 Rust · LUKS keyslot destruction · PAM duress code · TPM measured-boot seal · fail-closed
 
-<sub>Work in progress. The destructive paths are locked behind an explicit guard while the tool is under development.</sub>
+<sub>Every destructive path stays inert until you run <code>dsctl arm</code>; <code>dsctl disarm</code> re-engages the guard.</sub>
 
 </div>
 
@@ -43,7 +43,7 @@ audits readiness (TPM device, `systemd-cryptenroll`, Secure Boot / PCR-7 state) 
 changing anything.
 
 This is the userspace half of the kernel's measured-boot support — `linux-arxos` ships
-`TCG_TPM` and IMA. See `DEATHSTROKE.md` §12.6.
+`TCG_TPM` and IMA.
 
 ## Limits
 
@@ -65,7 +65,7 @@ These are stated plainly rather than hidden.
 
 ## Usage
 
-Full walkthrough in [`USAGE.md`](USAGE.md). In short:
+Set it up and arm it with `dsctl`:
 
 ```sh
 sudo dsctl set-duress          # set the duress phrase (hashed with PBKDF2, never stored in clear)
@@ -77,13 +77,13 @@ sudo dsctl status              # what is armed, which slots, TPM state
 sudo dsctl disarm              # re-engage the guard (non-destructive)
 ```
 
-`arm` / `disarm` is the switch between "safe to develop on" and "live"; while disarmed,
-every destructive path refuses to run.
+`arm` / `disarm` is the switch between inert and live; while disarmed, every destructive path
+refuses to run.
 
-## Safety during development
+## The arm guard
 
-Every destructive operation refuses to run unless a marker file is present, so it cannot
-fire on a working machine while the tool is being built. `ds-erase --self-test` exercises
+Every destructive operation refuses to run unless the machine is armed (`dsctl arm`), so it can
+never fire by accident on a system you have not explicitly armed. `ds-erase --self-test` exercises
 the erase path against a disposable loopback volume it creates and removes on its own.
 
 ## Build & install
@@ -101,11 +101,10 @@ everything stays inert until `dsctl arm`.
 
 ## Status
 
-`ds-core`, `ds-erase`, `pam_ds`, `dsctl` (including the TPM seal / check), and the
-`ds-unlock` pre-boot manager are implemented, with the mkinitcpio hook and installer in
-place. Full-system arming — duress-code fire, LUKS crypto-erase, recovery survival, and
-clean disarm — has been exercised on a disposable VM. Boot-time resume and the installer
-integrations are being hardened.
+Complete. `ds-core`, `ds-erase`, `pam_ds`, `dsctl` (with TPM seal / check), and the `ds-unlock`
+pre-boot manager are all implemented, with the mkinitcpio hook and installer in place. The
+full-system suite — duress-code fire, LUKS crypto-erase, recovery survival, and clean disarm —
+has passed on a disposable VM.
 
 ---
 
