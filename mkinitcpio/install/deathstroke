@@ -16,12 +16,29 @@ build() {
     # the pre-boot manager + the eraser it calls on a duress/limit trigger
     add_binary /usr/bin/ds-unlock
     add_binary /usr/bin/ds-erase
+    # ds-unlock resolves the eraser via ["/usr/lib/arxos/deathstroke/ds-erase",
+    # "/usr/local/bin/ds-erase", "ds-erase"(PATH)]; /usr/bin is on the init PATH so the bare-name
+    # lookup already finds it, but expose it at the primary search path too so a minimal init
+    # environment can never break the wipe path.
+    add_file /usr/bin/ds-erase /usr/lib/arxos/deathstroke/ds-erase 755
     # crypto userspace + the kernel modules to open a LUKS2 volume
     add_binary /usr/bin/cryptsetup
     add_module 'dm-crypt'
     add_module 'dm-mod'
     map add_module 'nls_cp437' 'nls_iso8859-1' 'vfat'   # mount the FAT ESP for the counter/verifier
     add_module 'af_alg' 'algif_skcipher' 'xts' 'aes_x86_64' 2>/dev/null || true
+
+    # CRITICAL for the pre-boot wipe: ds-erase refuses to fire unless the disposable-machine marker
+    # is present, but that marker normally lives on the ENCRYPTED root, which is not mounted yet at
+    # the boot passphrase. Bake it into the initramfs so the duress/limit wipe can actually fire.
+    # This hook is only in HOOKS when the machine is armed, so the marker only ships on machines the
+    # user explicitly opted to make destructible. (It is an authorization flag, not a secret; the
+    # duress verifier hash on the ESP is the real gate.)
+    if [ -f /etc/arxos/deathstroke/DISPOSABLE_MACHINE_OK_TO_DESTROY ]; then
+        add_file /etc/arxos/deathstroke/DISPOSABLE_MACHINE_OK_TO_DESTROY
+    else
+        warning "deathstroke: DISPOSABLE marker absent at build time; pre-boot wipe will refuse to fire until 'dsctl arm' is re-run"
+    fi
 
     add_runscript
 }

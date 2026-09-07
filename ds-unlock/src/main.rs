@@ -142,14 +142,43 @@ fn find_ds_erase() -> String {
 // ---- prompt ----
 
 fn prompt_secret(device: &str) -> Result<String> {
-    // if a scripted secret is supplied (tests), use it; else read a line from the console (no echo is a
-    // TODO for the real hook via /dev/tty termios; initramfs prompts are typically plain).
+    // if a scripted secret is supplied (tests), use it.
     if let Ok(s) = std::env::var("DS_SECRET") { return Ok(s); }
+
+    // When Plymouth is running (the normal boot), the graphical splash OWNS the console: a plain
+    // eprint!/stdin read is drawn OVER and the user sees a splash with NO passphrase field and no
+    // idea input is wanted (the boot looks hung). So ask Plymouth for the password — this triggers
+    // the ArxOS theme's password_callback, rendering the branded "Enter passphrase to unlock ArxOS"
+    // field with masked bullets, and returns what the user typed. This is what makes the prompt
+    // VISIBLE. The lockout/wipe counter logic stays here in ds-unlock, one plymouth prompt per try.
+    if plymouth_active() {
+        let out = std::process::Command::new("plymouth")
+            .args(["ask-for-password", "--prompt", "Enter passphrase to unlock ArxOS"])
+            .output();
+        if let Ok(o) = out {
+            if o.status.success() {
+                // plymouth writes the password to stdout with a trailing newline.
+                let s = String::from_utf8_lossy(&o.stdout);
+                return Ok(s.trim_end_matches(['\n', '\r']).to_string());
+            }
+        }
+        // plymouth present but the ask failed: fall through to the plain console prompt below so a
+        // passphrase can still be entered (never leave the user with no way in).
+    }
+
+    // Fallback (no plymouth, or ask-for-password failed): plain console prompt. Kept for the
+    // no-splash path and for resilience.
     eprint!("Enter passphrase for {device}: ");
     std::io::stderr().flush().ok();
     let mut s = String::new();
     std::io::stdin().read_line(&mut s).context("read passphrase")?;
     Ok(s.trim_end_matches(['\n', '\r']).to_string())
+}
+
+/// Is a Plymouth daemon running and answering? (`plymouth --ping` exits 0 only if plymouthd is up.)
+fn plymouth_active() -> bool {
+    std::process::Command::new("plymouth").arg("--ping").status()
+        .map(|s| s.success()).unwrap_or(false)
 }
 
 fn flag(args: &[String], name: &str) -> Option<String> {
