@@ -9,3 +9,4 @@ anyhow.workspace = true
 ds-core = { path = "../ds-core" }
 zeroize.workspace = true
 getrandom.workspace = true
+rpassword.workspace = true

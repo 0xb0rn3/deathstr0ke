@@ -18,3 +18,4 @@ pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 subtle = "2"            # constant-time comparison
 zeroize = "1"          # scrub secrets from memory
 getrandom = "0.2"      # OS CSPRNG for the salt
+rpassword = "7"        # no-echo secret entry from the controlling terminal

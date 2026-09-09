@@ -12,29 +12,36 @@
 //                           failure; on the lockout line shows the wipe warning; at the wipe line fires.
 //   "authsucc"           -- runs AFTER a successful pam_unix. Resets the counter (any success clears it).
 //
-// The wipe action is ds-erase, itself guarded to a machine marked disposable. DS_FIRE_CMD overrides it
-// for testing. Thresholds come from DS_LOCKOUT_AT / DS_WIPE_AT / DS_COOLDOWN (else ds-core defaults).
+// The wipe action is ds-erase, itself guarded to a machine marked disposable. Test overrides are
+// accepted only with DS_TEST_MODE=1; production policy cannot be changed through PAM's environment.
 
 use pamsm::{pam_module, Pam, PamError, PamFlags, PamLibExt, PamServiceModule};
 use std::process::Command;
 
 struct PamDs;
 
-fn env_u32(k: &str, d: u32) -> u32 { std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d) }
-fn env_u64(k: &str, d: u64) -> u64 { std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d) }
-fn lockout_at() -> u32 { env_u32("DS_LOCKOUT_AT", ds_core::DEFAULT_LOCKOUT_AT) }
-fn wipe_at()    -> u32 { env_u32("DS_WIPE_AT", ds_core::DEFAULT_WIPE_AT) }
-fn cooldown()   -> u64 { env_u64("DS_COOLDOWN", ds_core::DEFAULT_COOLDOWN_SECS) }
+fn test_mode() -> bool { ds_core::test_mode() }
+fn test_u32(k: &str, d: u32) -> u32 {
+    if test_mode() { std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d) } else { d }
+}
+fn test_u64(k: &str, d: u64) -> u64 {
+    if test_mode() { std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d) } else { d }
+}
+fn lockout_at() -> u32 { test_u32("DS_LOCKOUT_AT", ds_core::DEFAULT_LOCKOUT_AT) }
+fn wipe_at()    -> u32 { test_u32("DS_WIPE_AT", ds_core::DEFAULT_WIPE_AT) }
 
 /// Is the tool armed here (a duress verifier enrolled)? If not, the module is inert.
-fn armed() -> bool { std::path::Path::new(&ds_core::duress_hash_path()).exists() }
+fn armed() -> bool { std::path::Path::new(ds_core::ARMED_MARKER).exists() || test_mode() }
 
 impl PamServiceModule for PamDs {
     fn authenticate(pamh: Pam, _flags: PamFlags, args: Vec<String>) -> PamError {
         if !armed() { return PamError::IGNORE; }
         match args.first().map(String::as_str) {
             Some("authfail") => on_authfail(),
-            Some("authsucc") => { ds_core::reset_attempts(); PamError::IGNORE }
+            Some("authsucc") => match ds_core::reset_attempts() {
+                Ok(()) => PamError::IGNORE,
+                Err(e) => { eprintln!("pam_ds: cannot reset armed attempt state: {e:#}"); PamError::AUTH_ERR }
+            }
             _ => preauth_and_duress(pamh),   // default / "duress"
         }
     }
@@ -49,17 +56,21 @@ impl PamServiceModule for PamDs {
 /// time-based cooldown is wanted it belongs on pam_unix/faillock, which does not block our escalation.)
 fn preauth_and_duress(pamh: Pam) -> PamError {
     let stored = match std::fs::read_to_string(ds_core::duress_hash_path()) {
-        Ok(s) => s, Err(_) => return PamError::IGNORE,
+        Ok(s) => s,
+        Err(e) => { eprintln!("pam_ds: armed verifier unreadable: {e}"); return PamError::AUTH_ERR; }
     };
     let verifier = match ds_core::DuressHash::parse(&stored) {
-        Ok(v) => v, Err(_) => return PamError::IGNORE,
+        Ok(v) => v,
+        Err(e) => { eprintln!("pam_ds: armed verifier invalid: {e:#}"); return PamError::AUTH_ERR; }
     };
     let authtok = match pamh.get_authtok(None) {
-        Ok(Some(t)) => t, _ => return PamError::IGNORE,
+        Ok(Some(t)) => t,
+        _ => { eprintln!("pam_ds: could not read authentication token while armed"); return PamError::AUTH_ERR; }
     };
     match verifier.verify(authtok.to_bytes()) {
         Ok(true) => { fire(); PamError::AUTH_ERR }   // duress: instant wipe, never a session
-        _ => PamError::IGNORE,                        // real password: let pam_unix decide
+        Ok(false) => PamError::IGNORE,                // real password: let pam_unix decide
+        Err(e) => { eprintln!("pam_ds: verifier failed while armed: {e:#}"); PamError::AUTH_ERR }
     }
 }
 
@@ -72,13 +83,19 @@ fn preauth_and_duress(pamh: Pam) -> PamError {
 /// console is trivially bypassed by rebooting anyway. A per-attempt delay slows a brute-force just as
 /// well and cannot break escalation. DS_LOCKOUT_DELAY sets the delay (seconds; 0 in tests).
 fn on_authfail() -> PamError {
-    let count = ds_core::record_failure().unwrap_or(0);
+    let count = match ds_core::record_failure() {
+        Ok(count) => count,
+        Err(e) => {
+            eprintln!("pam_ds: cannot durably record failure while armed; denying authentication: {e:#}");
+            return PamError::AUTH_ERR;
+        }
+    };
     if ds_core::should_wipe(count, wipe_at()) {
         eprintln!("\nDEATHSTROKE: attempt limit reached. Destroying this system.");
         fire();
     } else if ds_core::crossed_lockout(count, lockout_at()) {
         eprintln!("\nDEATHSTROKE WARNING: too many failed attempts. Further failures will DESTROY this system.");
-        let delay = env_u64("DS_LOCKOUT_DELAY", 10);   // seconds of pacing past the lockout line
+        let delay = test_u64("DS_LOCKOUT_DELAY", 10);   // seconds of pacing past the lockout line
         if delay > 0 { std::thread::sleep(std::time::Duration::from_secs(delay)); }
     }
     PamError::AUTH_ERR
@@ -86,12 +103,20 @@ fn on_authfail() -> PamError {
 
 /// Launch the wipe action without waiting (auth must not hang). Default is the guarded erase actor.
 fn fire() {
-    if let Ok(cmd) = std::env::var("DS_FIRE_CMD") {
+    if test_mode() {
+        if let Ok(cmd) = std::env::var("DS_FIRE_CMD") {
         let mut parts = cmd.split_whitespace();
-        if let Some(prog) = parts.next() { let _ = Command::new(prog).args(parts).spawn(); }
+        if let Some(prog) = parts.next() {
+            if let Err(e) = Command::new(prog).args(parts).spawn() {
+                eprintln!("pam_ds: test erase actor failed to launch: {e}");
+            }
+        }
         return;
+        }
     }
-    let _ = Command::new(format!("{}/ds-erase", ds_core::LIB_DIR)).arg("--fire").spawn();
+    if let Err(e) = Command::new(format!("{}/ds-erase", ds_core::LIB_DIR)).arg("--fire").spawn() {
+        eprintln!("pam_ds: failed to launch erase actor: {e}");
+    }
 }
 
 pam_module!(PamDs);

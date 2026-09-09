@@ -19,14 +19,19 @@ trigger.tamper_usb      = false   # unexpected new USB mass-storage while armed.
 duress.kdf = pbkdf2-sha256
 duress.iterations = 600000
 
-# recovery keyslot metadata. The key itself is never stored; the user holds it.
-#   dsctl enroll-recovery adds a LUKS keyslot via `cryptsetup luksAddKey`.
-recovery.keyslot = -1             # -1 = not enrolled. Set to the LUKS slot index once enrolled.
-recovery.device  = ""             # the LUKS device the recovery slot was added to.
+# keyslot metadata. The keys themselves are never stored; the user holds them.
+# `dsctl enroll-recovery` proves which slot each credential opens before recording these values.
+daily.keyslot    = -1             # normal unlock credential; product triggers destroy only this slot.
+recovery.keyslot = -1             # offline recovery credential; product triggers preserve this slot.
+recovery.device  = ""             # canonical LUKS device containing both verified slots.
 
-# crypto-erase behaviour. The fast path is key destruction.
-erase.mode = lukserase           # lukserase (all slots) | killslot (in-use slot only)
-erase.destroy_header_backups = true   # a header backup defeats luksErase, so find and destroy it.
+# crypto-erase behaviour. Recovery-safe daily-slot destruction is the product default. An operator
+# can request full LUKS erase only with the separate explicit `--mode erase --destroy-recovery` pair.
+erase.mode = killslot
+erase.journal = /boot/efi/deathstroke/inprogress
+# Only backups inside the explicitly configured ESP scan root are removed. Unknown/offline copies
+# cannot be discovered or guaranteed destroyed, and SSD/flash overwrite semantics are device-specific.
+erase.destroy_known_header_backups = true
 erase.zero_ram_masterkey = true
 
 # self-removal on fire: remove the tool's own artifacts (PAM line, hashes, this config) as an early

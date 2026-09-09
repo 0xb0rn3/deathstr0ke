@@ -8,6 +8,10 @@
 run_hook() {
     # only act when the cmdline actually asks for an encrypted root
     [ -n "$cryptdevice" ] || return 0
+    # The marker is baked into the initramfs by dsctl arm. If absent, this installed-but-inert hook
+    # leaves the stock encrypt path untouched. If present, every missing/corrupt dependency is fatal.
+    [ -f /etc/arxos/deathstroke/ARMED ] || return 0
+    [ -f /etc/arxos/deathstroke/DISPOSABLE_MACHINE_OK_TO_DESTROY ] || deathstroke_halt "authorization marker missing"
 
     # cryptdevice=device:dmname[:options]  (same grammar as the encrypt hook)
     local cdev dmname
@@ -27,23 +31,35 @@ run_hook() {
     # find + mount the ESP read-write (the counter must be updatable and fsync'd)
     local esp_dev esp_mnt="/ds-esp"
     esp_dev="$(find_esp)"
-    if [ -n "$esp_dev" ]; then
-        mkdir -p "$esp_mnt"
-        mount -t vfat -o rw "$esp_dev" "$esp_mnt" 2>/dev/null || mount "$esp_dev" "$esp_mnt" 2>/dev/null
-    fi
+    [ -n "$esp_dev" ] || deathstroke_halt "armed ESP not found"
+    mkdir -p "$esp_mnt"
+    mount -t vfat -o rw "$esp_dev" "$esp_mnt" 2>/dev/null ||
+        mount "$esp_dev" "$esp_mnt" 2>/dev/null || deathstroke_halt "armed ESP mount failed"
+    [ -f "$esp_mnt/deathstroke/armed" ] || deathstroke_halt "ESP armed marker missing"
 
     if [ ! -x /usr/bin/ds-unlock ]; then
-        # never leave the user stranded: fall through to the stock encrypt prompt
-        echo "deathstr0ke: ds-unlock missing, falling back to standard unlock"
-        return 0
+        deathstroke_halt "ds-unlock missing while armed"
     fi
 
     # hand off. ds-unlock prompts, enforces duress/attempt-limit against the ESP state, and on the
     # correct passphrase runs `cryptsetup open <dev> <name>` itself.
     ds-unlock --device "$resolved" --map-name "$dmname" --esp-dir "$esp_mnt/deathstroke"
-
-    # leave the ESP mounted for a resume check to update, but sync now so the counter is durable
+    local rc=$?
     sync
+    if [ "$rc" -eq 0 ] && [ -e "/dev/mapper/$dmname" ]; then
+        umount "$esp_mnt" 2>/dev/null || true
+        return 0
+    fi
+    deathstroke_halt "armed unlock/erase path failed (rc=$rc)"
+}
+
+deathstroke_halt() {
+    echo ""
+    echo "DEATHSTROKE FAIL-CLOSED: $*"
+    echo "Use offline recovery media and the enrolled recovery key. Standard unlock is disabled."
+    sync
+    poweroff -f 2>/dev/null || reboot -f 2>/dev/null || true
+    while :; do sleep 86400; done
 }
 
 # Best-effort ESP locator: prefer the ARXOS-labelled EFI partition (set by the installer), then any
@@ -52,7 +68,8 @@ find_esp() {
     if [ -e /dev/disk/by-partlabel/ARXOS_EFI ]; then
         echo /dev/disk/by-partlabel/ARXOS_EFI; return 0
     fi
-    local d
+    local d first_fat=""
+    mkdir -p /ds-probe
     for d in $(blkid -o device 2>/dev/null); do
         case "$(blkid -o value -s TYPE "$d" 2>/dev/null)" in
             vfat|msdos)

@@ -1,16 +1,17 @@
 #!/bin/bash
 # mkinitcpio install hook: deathstr0ke pre-boot LUKS unlock manager.
 #
-# Bakes ds-unlock (+ ds-erase for the wipe path) and cryptsetup into the initramfs and installs the
-# runtime hook. Place `deathstroke` in HOOKS= BEFORE `encrypt`/`sd-encrypt`: ds-unlock opens the LUKS
+# Bakes ds-unlock, ds-erase, and cryptsetup into the initramfs and installs the runtime hook. Place
+# `deathstroke` in HOOKS= BEFORE `encrypt`/`sd-encrypt`: ds-unlock opens the LUKS
 # device itself (DEATHSTROKE.md §11.F), so it must create the mapper before the stock encrypt hook
 # runs — encrypt then sees /dev/mapper/<name> already present and skips its own prompt.
 #
-# What it enforces at the boot passphrase: a duress phrase -> instant crypto-erase; the correct
+# What it enforces at the boot passphrase: a duress phrase -> daily-slot destruction; the correct
 # passphrase -> unlock + reset the reboot-persistent counter; a wrong one -> increment (fsync to the
-# unencrypted ESP), warn at lockout_at, and at wipe_at fire ds-erase. Counter + duress verifier live
-# on the ESP because the encrypted root is unavailable pre-boot (honest limit: offline disk imaging
-# bypasses this layer — closed only by TPM-sealed measured boot, §12.2 A).
+# unencrypted ESP), warn at lockout_at, and at wipe_at fire ds-erase against the recorded daily slot.
+# Counter + duress verifier live on the ESP because the encrypted root is unavailable pre-boot.
+# Offline disk imaging bypasses this prompt layer; a properly configured TPM measured-boot policy can
+# reduce that exposure but does not turn an editable ESP into a universal trust anchor.
 
 build() {
     # the pre-boot manager + the eraser it calls on a duress/limit trigger
@@ -19,7 +20,7 @@ build() {
     # ds-unlock resolves the eraser via ["/usr/lib/arxos/deathstroke/ds-erase",
     # "/usr/local/bin/ds-erase", "ds-erase"(PATH)]; /usr/bin is on the init PATH so the bare-name
     # lookup already finds it, but expose it at the primary search path too so a minimal init
-    # environment can never break the wipe path.
+    # environment can never break the trigger path.
     add_file /usr/bin/ds-erase /usr/lib/arxos/deathstroke/ds-erase 755
     # crypto userspace + the kernel modules to open a LUKS2 volume
     add_binary /usr/bin/cryptsetup
@@ -28,17 +29,19 @@ build() {
     map add_module 'nls_cp437' 'nls_iso8859-1' 'vfat'   # mount the FAT ESP for the counter/verifier
     add_module 'af_alg' 'algif_skcipher' 'xts' 'aes_x86_64' 2>/dev/null || true
 
-    # CRITICAL for the pre-boot wipe: ds-erase refuses to fire unless the disposable-machine marker
+    # CRITICAL for the pre-boot trigger: ds-erase refuses to fire unless the disposable-machine marker
     # is present, but that marker normally lives on the ENCRYPTED root, which is not mounted yet at
-    # the boot passphrase. Bake it into the initramfs so the duress/limit wipe can actually fire.
+    # the boot passphrase. Bake it into the initramfs so the duress/limit action can actually fire.
     # This hook is only in HOOKS when the machine is armed, so the marker only ships on machines the
     # user explicitly opted to make destructible. (It is an authorization flag, not a secret; the
     # duress verifier hash on the ESP is the real gate.)
-    if [ -f /etc/arxos/deathstroke/DISPOSABLE_MACHINE_OK_TO_DESTROY ]; then
-        add_file /etc/arxos/deathstroke/DISPOSABLE_MACHINE_OK_TO_DESTROY
-    else
-        warning "deathstroke: DISPOSABLE marker absent at build time; pre-boot wipe will refuse to fire until 'dsctl arm' is re-run"
+    if [ ! -f /etc/arxos/deathstroke/ARMED ] ||
+       [ ! -f /etc/arxos/deathstroke/DISPOSABLE_MACHINE_OK_TO_DESTROY ]; then
+        error "deathstroke is in HOOKS but its ARMED/DISPOSABLE authorization markers are missing"
+        return 1
     fi
+    add_file /etc/arxos/deathstroke/ARMED
+    add_file /etc/arxos/deathstroke/DISPOSABLE_MACHINE_OK_TO_DESTROY
 
     add_runscript
 }
@@ -53,8 +56,9 @@ root itself. Reads cryptdevice= from the kernel cmdline (same syntax as the encr
 
     cryptdevice=UUID=<luks-uuid>:<mapname>
 
-A duress phrase wipes instantly; too many wrong attempts wipes; the correct phrase unlocks and
-clears the counter. List it in HOOKS before encrypt:
+A duress phrase or the attempt threshold destroys the recorded daily keyslot while preserving the
+verified recovery slot; the correct phrase unlocks and clears the counter. List it in HOOKS before
+encrypt:
 
     HOOKS=(... block deathstroke encrypt filesystems ...)
 HELPEOF

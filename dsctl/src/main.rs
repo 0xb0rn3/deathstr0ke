@@ -1,22 +1,22 @@
 // dsctl: the setup and control CLI. The non-destructive parts (set the duress code as a hash, verify
 // a candidate, show status) are real and testable anywhere. The destructive and system-altering parts
-// (enroll a LUKS recovery keyslot, insert the PAM line, enable the resume unit, i.e. "arm") only run
+// (enroll a LUKS recovery keyslot, integrate PAM, and rebuild the armed initramfs) only run
 // on a machine marked disposable while they are under development. dsctl never stores the duress code,
 // only its PBKDF2 hash. It reads and writes only the state dir; arming shells to stock cryptsetup and
 // edits /etc/pam.d.
 
 use anyhow::{bail, Context, Result};
 use ds_core::{derive_and_zero, DuressHash, DEFAULT_ITERATIONS};
-use std::io::Write;
-use std::path::Path;
+use std::collections::BTreeSet;
+use std::io::IsTerminal;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Value of a `--name value` flag, if present.
 fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
 }
-
-const DISPOSABLE_MARKER: &str = "/etc/arxos/deathstroke/DISPOSABLE_MACHINE_OK_TO_DESTROY";
 
 fn main() {
     if let Err(e) = run(std::env::args().skip(1).collect()) {
@@ -27,7 +27,7 @@ fn main() {
 
 fn run(args: Vec<String>) -> Result<()> {
     match args.first().map(String::as_str) {
-        Some("set-duress") => set_duress(),
+        Some("set-duress") => set_duress(&args),
         Some("verify")     => verify(args.get(1).map(String::as_str)),
         Some("status")     => status(),
         Some("enroll-recovery") => enroll_recovery(&args),
@@ -46,12 +46,11 @@ fn run(args: Vec<String>) -> Result<()> {
     }
 }
 
-// Where PAM finds the module and where the resume unit lives.
+// Where PAM finds the module. Boot resume is handled inside the initramfs, where the ESP exists
+// before root unlock; the old pre-cryptsetup systemd unit incorrectly pointed into encrypted /var.
 const PAM_MODULE: &str = "/usr/lib/security/pam_ds.so";
 const SYSTEM_AUTH: &str = "/etc/pam.d/system-auth";
 const ARM_MARKER: &str = "deathstr0ke-arm";
-const RESUME_UNIT_SRC: &str = "/usr/lib/arxos/deathstroke/deathstroke-resume.service.disabled";
-const RESUME_UNIT_DST: &str = "/etc/systemd/system/deathstroke-resume.service";
 
 // ---- factor menu: detect hardware + enroll unlock factors via systemd-cryptenroll ----
 
@@ -121,7 +120,8 @@ fn enroll_factor(args: &[String]) -> Result<()> {
     let st = Command::new(&ce[0]).args(&ce[1..]).status().context("systemd-cryptenroll")?;
     if !st.success() { bail!("enroll {kind} failed"); }
     // record the factor as enabled (metadata only; no secret).
-    let _ = std::fs::write(format!("{}/factor.{kind}", ds_core::state_dir()), "enrolled");
+    ensure_state_dir()?;
+    ds_core::atomic_write(&Path::new(&ds_core::state_dir()).join(format!("factor.{kind}")), b"enrolled\n", 0o600)?;
     println!("dsctl: {kind} enrolled. Keep the passphrase + a backup factor so you are never locked out.");
     Ok(())
 }
@@ -138,19 +138,18 @@ fn enroll_fido2_simulated(device: &str, existing_keyfile: Option<String>) -> Res
     if !Path::new(&cred).exists() {
         let mut buf = [0u8; 32];
         getrandom::getrandom(&mut buf).map_err(|e| anyhow::anyhow!("csprng: {e}"))?;
-        std::fs::write(&cred, buf)?;
-        let _ = Command::new("chmod").args(["600", &cred]).status();
+        ds_core::atomic_write(Path::new(&cred), &buf, 0o600)?;
     }
     // the secret the "token" returns for this device = the keyslot's key material.
     let keyfile = format!("{dir}/fido2-sim.key");
-    std::fs::copy(&cred, &keyfile)?;
-    let _ = Command::new("chmod").args(["600", &keyfile]).status();
+    let credential = std::fs::read(&cred)?;
+    ds_core::atomic_write(Path::new(&keyfile), &credential, 0o600)?;
 
     let mut a = vec!["luksAddKey".to_string(), device.to_string(), keyfile.clone()];
     if let Some(ek) = existing_keyfile { a.push("--key-file".into()); a.push(ek); }
     let st = Command::new("cryptsetup").args(&a).status().context("cryptsetup luksAddKey (sim)")?;
     if !st.success() { bail!("simulated fido2 luksAddKey failed"); }
-    let _ = std::fs::write(format!("{dir}/factor.fido2"), "enrolled (simulated)");
+    ds_core::atomic_write(Path::new(&format!("{dir}/factor.fido2")), b"enrolled (simulated)\n", 0o600)?;
     println!("dsctl: fido2 (SIMULATED) enrolled on {device}. The token secret now unlocks a keyslot.");
     println!("       (physical USB handshake unproven in sim; verify with a real key or the VM USB-HID sim.)");
     Ok(())
@@ -207,17 +206,18 @@ fn seal_tpm(args: &[String]) -> Result<()> {
     println!("dsctl: sealing a keyslot to the TPM on {device} (PCRs {pcrs}{})", if with_pin { ", PIN" } else { "" });
     let st = Command::new(&ce[0]).args(&ce[1..]).status().context("systemd-cryptenroll tpm2")?;
     if !st.success() { bail!("TPM seal failed"); }
-    let _ = std::fs::write(format!("{}/factor.tpm2", ds_core::state_dir()), format!("sealed pcrs={pcrs}"));
+    ensure_state_dir()?;
+    ds_core::atomic_write(&Path::new(&ds_core::state_dir()).join("factor.tpm2"), format!("sealed pcrs={pcrs}\n").as_bytes(), 0o600)?;
     println!("dsctl: TPM measured-boot seal enrolled. The disk now unlocks only on this unmodified boot chain.");
     println!("       Keep the passphrase + a backup factor: a TPM clear or mainboard change needs them.");
     Ok(())
 }
 
-// ---- dead-man switch: auto-wipe if the user does not check in within a window (DEATHSTROKE.md §12.2 C) ----
+// ---- dead-man switch: destroy the daily slot if the user misses a check-in window (§12.2 C) ----
 //
 // Defends the "seize it, isolate it, analyze it at leisure" case: if the machine is not re-authed /
-// checked in by a deadline, it wipes. State is a last-checkin timestamp + a window; a boot-time and
-// periodic check compares now-vs-deadline and fires ds-erase if overdue. `checkin` (run on any
+// checked in by a deadline, it fires the recovery-safe actor. State is a last-checkin timestamp + a window; a boot-time and
+// periodic check compares now-vs-deadline and destroys the recorded daily slot if overdue. `checkin` (run on any
 // successful login, or by the user) resets the clock.
 
 fn deadman_state() -> String { format!("{}/deadman", ds_core::state_dir()) }
@@ -228,15 +228,15 @@ fn deadman(args: &[String]) -> Result<()> {
     require_root()?;
     match args.get(1).map(String::as_str) {
         Some("off") | Some("disable") => {
-            let _ = std::fs::remove_file(deadman_state());
+            remove_if_exists(Path::new(&deadman_state()))?;
             println!("dsctl: dead-man switch disabled.");
         }
         Some(h) => {
             let hours: u64 = h.parse().context("deadman <hours> | off")?;
             if hours == 0 { bail!("window must be > 0 hours"); }
-            std::fs::create_dir_all(ds_core::state_dir()).ok();
-            std::fs::write(deadman_state(), format!("window_secs={}\nlast_checkin={}\n", hours * 3600, now_unix()))?;
-            println!("dsctl: dead-man switch armed. Check in at least every {hours}h (dsctl checkin), or it wipes.");
+            ensure_state_dir()?;
+            ds_core::atomic_write(Path::new(&deadman_state()), format!("window_secs={}\nlast_checkin={}\n", hours * 3600, now_unix()).as_bytes(), 0o600)?;
+            println!("dsctl: dead-man switch armed. Check in at least every {hours}h (dsctl checkin), or it destroys the daily slot.");
         }
         None => {
             // report status
@@ -244,7 +244,7 @@ fn deadman(args: &[String]) -> Result<()> {
                 Some((win, last)) => {
                     let due = last + win;
                     let remain = due.saturating_sub(now_unix());
-                    println!("dead-man switch: ARMED, window {}h, {}h {}m until wipe (checkin to reset)",
+                    println!("dead-man switch: ARMED, window {}h, {}h {}m until daily-slot destruction (checkin to reset)",
                              win / 3600, remain / 3600, (remain % 3600) / 60);
                 }
                 None => println!("dead-man switch: disabled"),
@@ -258,22 +258,24 @@ fn deadman(args: &[String]) -> Result<()> {
 fn checkin() -> Result<()> {
     require_root()?;
     if let Some((win, _)) = read_deadman() {
-        std::fs::write(deadman_state(), format!("window_secs={win}\nlast_checkin={}\n", now_unix()))?;
+        ds_core::atomic_write(Path::new(&deadman_state()), format!("window_secs={win}\nlast_checkin={}\n", now_unix()).as_bytes(), 0o600)?;
         println!("dsctl: checked in. Dead-man clock reset.");
     }
     Ok(())
 }
 
-/// The periodic/boot check: if armed AND overdue, fire the wipe. Called by a systemd timer + at boot.
+/// The periodic/boot check: if armed AND overdue, fire daily-slot destruction. Called by a timer + at boot.
 /// (Exposed as a hidden verb so the packaged timer can call `dsctl deadman-check`.)
 fn deadman_check() -> Result<i32> {
     match read_deadman() {
         Some((win, last)) if now_unix() > last + win => {
-            eprintln!("DEATHSTROKE: dead-man switch expired (no check-in). Destroying this system.");
+            eprintln!("DEATHSTROKE: dead-man switch expired (no check-in). Destroying the recorded daily slot.");
             let dev = configured_target().context("no target device configured")?;
             let erase = ["/usr/lib/arxos/deathstroke/ds-erase", "/usr/local/bin/ds-erase", "ds-erase"]
                 .iter().find(|p| Path::new(p).exists()).unwrap_or(&"ds-erase").to_string();
-            let st = Command::new(erase).args(["--fire", "--device", &dev, "--mode", "erase"]).status();
+            // The product trigger is recovery-safe: ds-erase resolves the recorded daily.slot and
+            // preserves recovery.slot. Full LUKS erase requires a separate explicit operator flag.
+            let st = Command::new(erase).args(["--fire", "--device", &dev]).status();
             Ok(if st.map(|s| s.success()).unwrap_or(false) { 2 } else { 1 })
         }
         _ => Ok(0),   // not armed or not overdue
@@ -293,6 +295,49 @@ fn now_unix() -> u64 {
 fn configured_target() -> Option<String> {
     std::fs::read_to_string(format!("{}/target.device", ds_core::state_dir())).ok()
         .map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+fn validate_luks_device(device: &str) -> Result<()> {
+    if device.is_empty() || device.len() > 4096 || device.contains(['\n', '\r', '\0']) {
+        bail!("invalid LUKS device path");
+    }
+    let resolved = std::fs::canonicalize(device).with_context(|| format!("resolve {device}"))?;
+    if !resolved.starts_with("/dev/") { bail!("LUKS device must resolve below /dev"); }
+    if !std::fs::metadata(&resolved)?.file_type().is_block_device() {
+        bail!("LUKS target is not a block device: {}", resolved.display());
+    }
+    let status = Command::new("cryptsetup").args(["isLuks", device]).status().context("cryptsetup isLuks")?;
+    if !status.success() { bail!("target is not a valid LUKS container: {device}"); }
+    Ok(())
+}
+
+fn active_keyslots(device: &str) -> Result<BTreeSet<u8>> {
+    let out = Command::new("cryptsetup").args(["luksDump", device]).output().context("cryptsetup luksDump")?;
+    if !out.status.success() { bail!("luksDump failed on {device}"); }
+    let mut slots = BTreeSet::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let trimmed = line.trim_start();
+        if let Some((number, kind)) = trimmed.split_once(':') {
+            if kind.trim_start().starts_with("luks2") {
+                if let Ok(slot) = number.parse::<u8>() { slots.insert(slot); }
+            }
+        }
+    }
+    if slots.is_empty() { bail!("LUKS container has no active keyslots"); }
+    Ok(slots)
+}
+
+fn matching_keyslots(device: &str, keyfile: &str) -> Result<Vec<u8>> {
+    if !Path::new(keyfile).is_file() { bail!("keyfile does not exist: {keyfile}"); }
+    let mut matches = Vec::new();
+    for slot in active_keyslots(device)? {
+        let status = Command::new("cryptsetup")
+            .args(["open", "--test-passphrase", "--key-file", keyfile, "--key-slot", &slot.to_string(), device])
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .status().context("cryptsetup slot verification")?;
+        if status.success() { matches.push(slot); }
+    }
+    Ok(matches)
 }
 
 // ---- offline hardening: strong LUKS KDF + anti-forensic posture (DEATHSTROKE.md §12.2/§10.1) ----
@@ -352,10 +397,10 @@ fn harden(args: &[String]) -> Result<()> {
     if !st.success() { bail!("luksConvertKey failed (wrong passphrase, or already at this KDF)"); }
     // record the recommended kernel posture for the installer/kernel config to enforce.
     let dir = ds_core::state_dir();
-    let _ = std::fs::write(format!("{dir}/harden.recommend"),
+    ds_core::atomic_write(Path::new(&format!("{dir}/harden.recommend")),
         "kernel_cmdline: init_on_free=1 init_on_alloc=1 slab_nomerge lockdown=confidentiality\n\
          hibernation: disabled (or encrypted swap with a random per-boot key)\n\
-         swap: none, zram, or dm-crypt only (never plaintext)\n");
+         swap: none, zram, or dm-crypt only (never plaintext)\n".as_bytes(), 0o600)?;
     println!("dsctl: KDF hardened. Kernel/swap posture written to {dir}/harden.recommend (audit with `dsctl harden-check`).");
     Ok(())
 }
@@ -366,122 +411,432 @@ fn harden(args: &[String]) -> Result<()> {
 fn enroll_recovery(args: &[String]) -> Result<()> {
     require_root()?;
     guard_disposable("enroll-recovery")?;
+    if Path::new(ds_core::ARMED_MARKER).exists() { bail!("disarm before changing recovery slots"); }
     let device = flag(args, "--device").context("enroll-recovery needs --device <luks-dev>")?;
     // key-files keep the test non-interactive: --existing-keyfile authorises, --new-keyfile is enrolled.
     let existing = flag(args, "--existing-keyfile").context("need --existing-keyfile <path>")?;
     let newkey = flag(args, "--new-keyfile").context("need --new-keyfile <path>")?;
+    validate_luks_device(&device)?;
+    let daily_matches = matching_keyslots(&device, &existing)?;
+    if daily_matches.len() != 1 {
+        bail!("existing daily credential must match exactly one active slot; matched {daily_matches:?}");
+    }
+    let before = active_keyslots(&device)?;
     let st = Command::new("cryptsetup")
         .args(["luksAddKey", &device, &newkey, "--key-file", &existing])
         .status().context("cryptsetup luksAddKey")?;
     if !st.success() { bail!("luksAddKey failed on {device}"); }
-    // record the device in state (metadata only, never the key). recovery.device documents where the
-    // recovery slot lives; target.device is what ds-erase destroys on a duress trigger (the same LUKS
-    // root), so pam_ds can fire `ds-erase --fire` with no arguments.
-    let _ = std::fs::write(format!("{}/recovery.device", ds_core::state_dir()), &device);
-    let _ = std::fs::write(format!("{}/target.device", ds_core::state_dir()), &device);
-    println!("dsctl: recovery keyslot enrolled on {device} (erase target set).");
+    let after = active_keyslots(&device)?;
+    let added: Vec<u8> = after.difference(&before).copied().collect();
+    if added.len() != 1 {
+        bail!("recovery enrollment did not add exactly one identifiable slot; added {added:?}");
+    }
+    let recovery_matches = matching_keyslots(&device, &newkey)?;
+    if recovery_matches != added {
+        bail!("new recovery credential did not verify only against the added slot");
+    }
+    ensure_state_dir()?;
+    let dir = PathBuf::from(ds_core::state_dir());
+    ds_core::atomic_write(&dir.join("recovery.device"), format!("{device}\n").as_bytes(), 0o600)?;
+    ds_core::atomic_write(&dir.join("target.device"), format!("{device}\n").as_bytes(), 0o600)?;
+    ds_core::atomic_write(&dir.join("daily.slot"), format!("{}\n", daily_matches[0]).as_bytes(), 0o600)?;
+    ds_core::atomic_write(&dir.join("recovery.slot"), format!("{}\n", added[0]).as_bytes(), 0o600)?;
+    println!("dsctl: recovery slot {} verified on {device}; protected daily slot {} recorded.", added[0], daily_matches[0]);
     Ok(())
 }
 
-/// Arm: place pam_ds into the auth stack and enable the boot-resume unit. Reversible via `disarm`.
-/// The PAM line is inserted as the FIRST auth rule with a control map that treats our module's IGNORE
-/// as "fall through" and its AUTH_ERR (a duress match) as "fail now", so a normal password is
-/// unaffected and a duress code fails auth after firing. This ordering needs no fragile offset maths.
+/// Arm only after the recovery/daily slots, verifier, policy, ESP mirror, PAM stack, and rebuilt
+/// initramfs can all be proven. Any failure restores the original PAM file and removes armed markers.
 fn arm() -> Result<()> {
     require_root()?;
     guard_disposable("arm")?;
     if !Path::new(PAM_MODULE).exists() { bail!("{PAM_MODULE} not deployed"); }
-    if !Path::new(&ds_core::duress_hash_path()).exists() { bail!("no duress code enrolled (dsctl set-duress)"); }
-    let content = std::fs::read_to_string(SYSTEM_AUTH).with_context(|| format!("read {SYSTEM_AUTH}"))?;
-    if content.contains(ARM_MARKER) { println!("dsctl: already armed."); return Ok(()); }
-    std::fs::copy(SYSTEM_AUTH, format!("{SYSTEM_AUTH}.deathstr0ke.bak")).context("backup system-auth")?;
-
-    // A faillock-style 3-line stack so we can tell a wrong password (a real failure, seen only AFTER
-    // pam_unix rejects it) from a right one:
-    //   PREAUTH (first): enforce a lockout + detect the duress code. IGNORE lets the stack proceed;
-    //                    a duress match / active lockout returns AUTH_ERR (default=die -> fail).
-    //   AUTHFAIL (after pam_unix, failure path only): count the consecutive failure + escalate.
-    //   AUTHSUCC (after a success): reset the counter.
-    let preauth  = format!("auth      [success=ignore ignore=ignore default=die]     {PAM_MODULE}                # {ARM_MARKER}");
-    let authfail = format!("auth      [default=die]                                  {PAM_MODULE}   authfail     # {ARM_MARKER}");
-    let authsucc = format!("auth      sufficient                                     {PAM_MODULE}   authsucc     # {ARM_MARKER}");
-
-    let mut v: Vec<String> = content.lines().map(String::from).collect();
-    // preauth goes before the first auth line (runs first); authfail/authsucc go after the LAST auth
-    // line (so they run after pam_unix has decided).
-    let first_auth = v.iter().position(|l| l.trim_start().starts_with("auth"));
-    let last_auth = v.iter().rposition(|l| l.trim_start().starts_with("auth"));
-    match (first_auth, last_auth) {
-        (Some(fa), Some(la)) => {
-            v.insert(la + 1, authsucc);
-            v.insert(la + 1, authfail);
-            v.insert(fa, preauth);
-        }
-        _ => { v.insert(0, authsucc); v.insert(0, authfail); v.insert(0, preauth); }
+    let verifier = std::fs::read_to_string(ds_core::duress_hash_path()).context("read duress verifier")?;
+    DuressHash::parse(&verifier).context("invalid duress verifier")?;
+    let policy = read_policy()?;
+    policy.validate()?;
+    let target = configured_target().context("no verified recovery target; run enroll-recovery")?;
+    validate_luks_device(&target)?;
+    let daily_slot = read_slot("daily.slot")?;
+    let recovery_slot = read_slot("recovery.slot")?;
+    if daily_slot == recovery_slot { bail!("daily and recovery slots must differ"); }
+    let slots = active_keyslots(&target)?;
+    if !slots.contains(&daily_slot) || !slots.contains(&recovery_slot) {
+        bail!("recorded daily/recovery slots are not both active");
     }
-    write_atomic(SYSTEM_AUTH, &(v.join("\n") + "\n"))?;
-    enable_resume_unit()?;
-    println!("dsctl: armed. Duress code + attempt-limit are live at every PAM surface; boot-resume enabled.");
+    let content = std::fs::read_to_string(SYSTEM_AUTH).with_context(|| format!("read {SYSTEM_AUTH}"))?;
+    let local_marker = Path::new(ds_core::ARMED_MARKER).is_file();
+    let esp_marker = Path::new(ds_core::ESP_STATE_DIR).join("armed").is_file();
+    if content.contains(ARM_MARKER) {
+        if local_marker && esp_marker {
+            println!("dsctl: already armed and markers are consistent.");
+            return Ok(());
+        }
+        bail!("PAM is marked armed but initramfs/ESP authorization markers are inconsistent; disarm from recovery media");
+    }
+    if local_marker || esp_marker {
+        bail!("authorization marker exists while PAM is unarmed; reconcile with dsctl disarm before arming");
+    }
+    let updated = arm_pam_stack(&content)?;
+    let backup = format!("{SYSTEM_AUTH}.deathstr0ke.bak");
+    let mode = std::fs::metadata(SYSTEM_AUTH)?.permissions().mode() & 0o7777;
+    ds_core::atomic_write(Path::new(&backup), content.as_bytes(), mode)?;
+    let mkinit_path = Path::new("/etc/mkinitcpio.conf");
+    let mkinit_original = std::fs::read(mkinit_path).context("snapshot mkinitcpio.conf")?;
+    let esp_paths = ["duress.hash", "config", "counter", "daily.slot", "recovery.slot", "armed"]
+        .map(|name| Path::new(ds_core::ESP_STATE_DIR).join(name));
+    let mut esp_snapshot: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
+    for path in esp_paths {
+        let old = match std::fs::read(&path) {
+            Ok(data) => Some(data),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e).with_context(|| format!("snapshot {}", path.display())),
+        };
+        esp_snapshot.push((path, old));
+    }
+
+    let result = (|| -> Result<()> {
+        sync_esp_state(&verifier, policy, daily_slot, recovery_slot)?;
+        ds_core::atomic_write(Path::new(ds_core::ARMED_MARKER), b"armed=1\n", 0o600)?;
+        ensure_deathstroke_hook_before_encrypt()?;
+        run_checked("mkinitcpio", &["-P"])?;
+        ds_core::atomic_write(&Path::new(ds_core::ESP_STATE_DIR).join("armed"), b"armed=1\n", 0o600)?;
+        // PAM is the last commit point: until all pre-boot artifacts are proven, login remains inert.
+        ds_core::atomic_write(Path::new(SYSTEM_AUTH), updated.as_bytes(), mode)?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        let mut rollback_errors = Vec::new();
+        if let Err(err) = ds_core::atomic_write(Path::new(SYSTEM_AUTH), content.as_bytes(), mode) {
+            rollback_errors.push(format!("restore PAM: {err:#}"));
+        }
+        let mkinit_mode = std::fs::metadata(mkinit_path).map(|m| m.permissions().mode() & 0o7777).unwrap_or(0o644);
+        if let Err(err) = ds_core::atomic_write(mkinit_path, &mkinit_original, mkinit_mode) {
+            rollback_errors.push(format!("restore mkinitcpio.conf: {err:#}"));
+        }
+        if let Err(err) = remove_if_exists(Path::new(ds_core::ARMED_MARKER)) {
+            rollback_errors.push(format!("remove local armed marker: {err:#}"));
+        }
+        for (path, old) in esp_snapshot {
+            let restored = if let Some(data) = old {
+                ds_core::atomic_write(&path, &data, 0o600)
+            } else {
+                remove_if_exists(&path)
+            };
+            if let Err(err) = restored {
+                rollback_errors.push(format!("restore {}: {err:#}", path.display()));
+            }
+        }
+        if let Err(err) = run_checked("mkinitcpio", &["-P"]) {
+            rollback_errors.push(format!("rebuild rolled-back initramfs: {err:#}"));
+        }
+        if !rollback_errors.is_empty() {
+            bail!(
+                "arm failed ({e:#}); rollback INCOMPLETE: {}. Boot only through offline recovery media",
+                rollback_errors.join("; ")
+            );
+        }
+        return Err(e).context("arm transaction rolled back");
+    }
+    println!("dsctl: armed. Recovery/daily slots, PAM, ESP state, and initramfs are verified.");
     Ok(())
 }
 
-/// Disarm: remove the pam_ds line (restoring the backup) and disable the resume unit. Login returns to
-/// stock. Always leaves a working auth stack.
+/// Disarm: restore the exact PAM backup, remove both armed markers, and rebuild initramfs so the
+/// initramfs-local authorization marker is gone.
 fn disarm() -> Result<()> {
     require_root()?;
     let content = std::fs::read_to_string(SYSTEM_AUTH).with_context(|| format!("read {SYSTEM_AUTH}"))?;
-    if !content.contains(ARM_MARKER) { println!("dsctl: not armed."); }
-    else {
-        let bak = format!("{SYSTEM_AUTH}.deathstr0ke.bak");
-        if Path::new(&bak).exists() {
-            let orig = std::fs::read_to_string(&bak)?;
-            write_atomic(SYSTEM_AUTH, &orig)?;
-            let _ = std::fs::remove_file(&bak);
-        } else {
-            // no backup: strip the marked line surgically.
-            let kept: Vec<&str> = content.lines().filter(|l| !l.contains(ARM_MARKER)).collect();
-            write_atomic(SYSTEM_AUTH, &(kept.join("\n") + "\n"))?;
+    if !content.contains(ARM_MARKER) { println!("dsctl: PAM is not armed; reconciling markers/initramfs."); }
+    let bak = format!("{SYSTEM_AUTH}.deathstr0ke.bak");
+    let backup = if content.contains(ARM_MARKER) {
+        Some(std::fs::read_to_string(&bak)
+            .context("PAM backup missing; refusing a partial disarm that could corrupt numeric control jumps")?)
+    } else { None };
+    let mode = std::fs::metadata(SYSTEM_AUTH)?.permissions().mode() & 0o7777;
+    let mkinit_path = Path::new("/etc/mkinitcpio.conf");
+    let mkinit_original = std::fs::read(mkinit_path).context("snapshot mkinitcpio.conf")?;
+    let mkinit_mode = std::fs::metadata(mkinit_path)?.permissions().mode() & 0o7777;
+    let local_was_armed = Path::new(ds_core::ARMED_MARKER).is_file();
+    let esp_armed_path = Path::new(ds_core::ESP_STATE_DIR).join("armed");
+    let esp_was_armed = esp_armed_path.is_file();
+    let disarm_result = (|| -> Result<()> {
+        if let Some(original) = &backup {
+            ds_core::atomic_write(Path::new(SYSTEM_AUTH), original.as_bytes(), mode)?;
         }
-        println!("dsctl: PAM line removed, stock auth restored.");
+        remove_if_exists(Path::new(ds_core::ARMED_MARKER))?;
+        remove_if_exists(&esp_armed_path)?;
+        remove_deathstroke_hook()?;
+        run_checked("mkinitcpio", &["-P"])
+    })();
+    if let Err(e) = disarm_result {
+        let mut rollback_errors = Vec::new();
+        if let Err(err) = ds_core::atomic_write(mkinit_path, &mkinit_original, mkinit_mode) {
+            rollback_errors.push(format!("restore mkinitcpio.conf: {err:#}"));
+        }
+        if local_was_armed {
+            if let Err(err) = ds_core::atomic_write(Path::new(ds_core::ARMED_MARKER), b"armed=1\n", 0o600) {
+                rollback_errors.push(format!("restore local armed marker: {err:#}"));
+            }
+        }
+        if esp_was_armed {
+            if let Err(err) = ds_core::atomic_write(&esp_armed_path, b"armed=1\n", 0o600) {
+                rollback_errors.push(format!("restore ESP armed marker: {err:#}"));
+            }
+        }
+        if backup.is_some() {
+            if let Err(err) = ds_core::atomic_write(Path::new(SYSTEM_AUTH), content.as_bytes(), mode) {
+                rollback_errors.push(format!("restore armed PAM: {err:#}"));
+            }
+        }
+        if let Err(err) = run_checked("mkinitcpio", &["-P"]) {
+            rollback_errors.push(format!("rebuild restored armed initramfs: {err:#}"));
+        }
+        if !rollback_errors.is_empty() {
+            bail!(
+                "disarm failed ({e:#}); rollback INCOMPLETE: {}. Boot only through offline recovery media",
+                rollback_errors.join("; ")
+            );
+        }
+        return Err(e).context("disarm failed; armed PAM, markers, and initramfs restored");
     }
-    disable_resume_unit();
+    if backup.is_some() { std::fs::remove_file(&bak).context("remove PAM backup")?; }
+    println!("dsctl: disarmed; stock PAM restored and armed markers removed from rebuilt initramfs.");
     Ok(())
 }
 
-fn enable_resume_unit() -> Result<()> {
-    if Path::new(RESUME_UNIT_SRC).exists() {
-        std::fs::copy(RESUME_UNIT_SRC, RESUME_UNIT_DST).context("install resume unit")?;
-        let _ = Command::new("systemctl").arg("daemon-reload").status();
-        let _ = Command::new("systemctl").args(["enable", "deathstroke-resume.service"]).status();
+fn read_policy() -> Result<ds_core::Policy> {
+    let path = Path::new(&ds_core::state_dir()).join("config");
+    match std::fs::read_to_string(&path) {
+        Ok(text) => ds_core::Policy::parse(&text).context("invalid local policy"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ds_core::Policy::default()),
+        Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+fn read_slot(name: &str) -> Result<u8> {
+    let path = Path::new(&ds_core::state_dir()).join(name);
+    let text = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let slot: u8 = text.trim().parse().context("invalid keyslot metadata")?;
+    if slot > 31 { bail!("keyslot outside 0..31"); }
+    Ok(slot)
+}
+
+fn sync_esp_state(verifier: &str, policy: ds_core::Policy, daily: u8, recovery: u8) -> Result<()> {
+    let dir = Path::new(ds_core::ESP_STATE_DIR);
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    ds_core::atomic_write(&dir.join("duress.hash"), verifier.as_bytes(), 0o600)?;
+    let config = format!(
+        "lockout_at={}\nwipe_at={}\nlockout_delay={}\nmax_prompts={}\n",
+        policy.lockout_at, policy.wipe_at, policy.lockout_delay, policy.max_prompts
+    );
+    ds_core::atomic_write(&dir.join("config"), config.as_bytes(), 0o600)?;
+    ds_core::atomic_write(&dir.join("counter"), b"0\n", 0o600)?;
+    ds_core::atomic_write(&dir.join("daily.slot"), format!("{daily}\n").as_bytes(), 0o600)?;
+    ds_core::atomic_write(&dir.join("recovery.slot"), format!("{recovery}\n").as_bytes(), 0o600)?;
+    Ok(())
+}
+
+fn ensure_deathstroke_hook_before_encrypt() -> Result<()> {
+    let path = Path::new("/etc/mkinitcpio.conf");
+    let original = std::fs::read_to_string(path).context("read /etc/mkinitcpio.conf")?;
+    let mut changed = false;
+    let mut saw_hooks = false;
+    let mut out = Vec::new();
+    for line in original.lines() {
+        if line.trim_start().starts_with("HOOKS=") {
+            saw_hooks = true;
+            let death = line.find("deathstroke");
+            let encrypt = line.find("encrypt").or_else(|| line.find("sd-encrypt"));
+            if let (Some(d), Some(e)) = (death, encrypt) {
+                if d > e { bail!("deathstroke hook must precede encrypt/sd-encrypt"); }
+                out.push(line.to_string());
+            } else if let Some(e) = encrypt {
+                let mut updated = line.to_string();
+                updated.insert_str(e, "deathstroke ");
+                out.push(updated);
+                changed = true;
+            } else {
+                bail!("HOOKS has no encrypt or sd-encrypt hook");
+            }
+        } else {
+            out.push(line.to_string());
+        }
+    }
+    if !saw_hooks { bail!("mkinitcpio.conf has no HOOKS line"); }
+    if changed {
+        let mode = std::fs::metadata(path)?.permissions().mode() & 0o7777;
+        ds_core::atomic_write(path, (out.join("\n") + "\n").as_bytes(), mode)?;
     }
     Ok(())
 }
-fn disable_resume_unit() {
-    let _ = Command::new("systemctl").args(["disable", "deathstroke-resume.service"]).status();
-    let _ = std::fs::remove_file(RESUME_UNIT_DST);
-    let _ = Command::new("systemctl").arg("daemon-reload").status();
-}
-fn write_atomic(path: &str, data: &str) -> Result<()> {
-    let tmp = format!("{path}.dstmp");
-    std::fs::write(&tmp, data).with_context(|| format!("write {tmp}"))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("rename into {path}"))?;
+
+fn remove_deathstroke_hook() -> Result<()> {
+    let path = Path::new("/etc/mkinitcpio.conf");
+    let original = std::fs::read_to_string(path).context("read /etc/mkinitcpio.conf")?;
+    let (updated, changed) = without_deathstroke_hook(&original)?;
+    if changed {
+        let mode = std::fs::metadata(path)?.permissions().mode() & 0o7777;
+        ds_core::atomic_write(path, updated.as_bytes(), mode)?;
+    }
     Ok(())
+}
+
+fn without_deathstroke_hook(original: &str) -> Result<(String, bool)> {
+    let mut changed = false;
+    let mut saw_hooks = false;
+    let mut out = Vec::new();
+    for line in original.lines() {
+        if line.trim_start().starts_with("HOOKS=") {
+            saw_hooks = true;
+            let mut updated = line.to_string();
+            while let Some(start) = updated.find("deathstroke") {
+                let end = start + "deathstroke".len();
+                let before = updated[..start].chars().next_back();
+                let after = updated[end..].chars().next();
+                let before_ok = before.is_none_or(|c| c.is_whitespace() || c == '(' || c == '"');
+                let after_ok = after.is_none_or(|c| c.is_whitespace() || c == ')' || c == '"');
+                if !before_ok || !after_ok {
+                    bail!("could not safely remove deathstroke token from HOOKS");
+                }
+                let remove_end = match after {
+                    Some(c) if c.is_whitespace() => end + c.len_utf8(),
+                    _ => end,
+                };
+                updated.replace_range(start..remove_end, "");
+                changed = true;
+            }
+            out.push(updated);
+        } else {
+            out.push(line.to_string());
+        }
+    }
+    if !saw_hooks { bail!("mkinitcpio.conf has no HOOKS line"); }
+    Ok((out.join("\n") + "\n", changed))
+}
+
+fn arm_pam_stack(content: &str) -> Result<String> {
+    if content.contains(ARM_MARKER) { bail!("PAM stack is already marked armed"); }
+    let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
+    let auth_positions: Vec<usize> = lines.iter().enumerate()
+        .filter_map(|(i, line)| is_auth_rule(line).then_some(i)).collect();
+    let first = *auth_positions.first().context("PAM stack has no auth rules")?;
+    let pam_unix_auth = auth_positions.iter().position(|&i| lines[i].contains("pam_unix.so"))
+        .context("unsupported PAM stack: no pam_unix auth rule")?;
+    let faillock_fail_auth = auth_positions.iter().position(|&i| {
+        lines[i].contains("pam_faillock.so") && lines[i].split_whitespace().any(|p| p == "authfail")
+    }).context("unsupported PAM stack: no pam_faillock authfail rule")?;
+    let faillock_succ_raw = auth_positions.iter().find_map(|&i| {
+        (lines[i].contains("pam_faillock.so") && lines[i].split_whitespace().any(|p| p == "authsucc")).then_some(i)
+    }).context("unsupported PAM stack: no pam_faillock authsucc rule")?;
+    if faillock_fail_auth <= pam_unix_auth { bail!("unsupported PAM order: authfail is not after pam_unix"); }
+
+    // Inserting our authfail before pam_faillock changes numeric success jumps that previously skipped
+    // the original authfail rule. Increase every crossing jump so successful authentication still
+    // lands at the same original module.
+    for auth_index in 0..faillock_fail_auth {
+        let raw = auth_positions[auth_index];
+        if let Some(jump) = success_jump(&lines[raw]) {
+            if auth_index + jump >= faillock_fail_auth {
+                lines[raw] = replace_success_jump(&lines[raw], jump + 1)?;
+            }
+        }
+    }
+    let fail_raw = auth_positions[faillock_fail_auth];
+    let authfail = format!("auth       [default=die]               {PAM_MODULE} authfail # {ARM_MARKER}");
+    lines.insert(fail_raw, authfail);
+    let succ_raw = if faillock_succ_raw >= fail_raw { faillock_succ_raw + 1 } else { faillock_succ_raw };
+    let authsucc = format!("auth       optional                    {PAM_MODULE} authsucc # {ARM_MARKER}");
+    lines.insert(succ_raw + 1, authsucc);
+    let preauth = format!("auth       [success=ignore ignore=ignore default=die] {PAM_MODULE} # {ARM_MARKER}");
+    lines.insert(first, preauth);
+    Ok(lines.join("\n") + "\n")
+}
+
+fn is_auth_rule(line: &str) -> bool {
+    let trimmed = line.trim_start().trim_start_matches('-');
+    trimmed.split_whitespace().next() == Some("auth")
+}
+
+fn success_jump(line: &str) -> Option<usize> {
+    let start = line.find("success=")? + "success=".len();
+    let digits: String = line[start..].chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() { None } else { digits.parse().ok() }
+}
+
+fn replace_success_jump(line: &str, value: usize) -> Result<String> {
+    let start = line.find("success=").context("no success control")? + "success=".len();
+    let len = line[start..].chars().take_while(|c| c.is_ascii_digit()).count();
+    if len == 0 { bail!("success control is not numeric"); }
+    let mut out = line.to_string();
+    out.replace_range(start..start + len, &value.to_string());
+    Ok(out)
+}
+
+fn run_checked(bin: &str, args: &[&str]) -> Result<()> {
+    let status = Command::new(bin).args(args).status().with_context(|| format!("run {bin}"))?;
+    if !status.success() { bail!("{bin} {} failed", args.join(" ")); }
+    Ok(())
+}
+
+fn remove_if_exists(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("remove {}", path.display())),
+    }
 }
 
 /// Prompt for a duress code (twice), derive a PBKDF2 verifier, write it to the state dir 0600. The
 /// plaintext code is scrubbed from memory immediately after derivation (zeroize). Non-destructive.
-fn set_duress() -> Result<()> {
+fn set_duress(args: &[String]) -> Result<()> {
     require_root()?;
-    let code = read_secret("Duress code: ")?;
-    let again = read_secret("Confirm duress code: ")?;
-    if code != again { bail!("codes did not match"); }
-    if code.len() < 6 { bail!("duress code too short (min 6 chars)"); }
+    if Path::new(ds_core::ARMED_MARKER).exists() { bail!("disarm before changing the duress verifier"); }
+    let policy = enrollment_policy(args)?;
+    let mut code = read_secret("Duress code: ")?;
+    let mut again = read_secret("Confirm duress code: ")?;
+    if code != again {
+        code.zeroize_now();
+        again.zeroize_now();
+        bail!("codes did not match");
+    }
+    again.zeroize_now();
+    if code.len() < 6 {
+        code.zeroize_now();
+        bail!("duress code too short (min 6 chars)");
+    }
     let h = derive_and_zero(code, DEFAULT_ITERATIONS)?;
     let path = ds_core::duress_hash_path();
     ensure_state_dir()?;
+    let config = format!(
+        "lockout_at={}\nwipe_at={}\nlockout_delay={}\nmax_prompts={}\n",
+        policy.lockout_at, policy.wipe_at, policy.lockout_delay, policy.max_prompts
+    );
+    ds_core::atomic_write(&Path::new(&ds_core::state_dir()).join("config"), config.as_bytes(), 0o600)?;
     write_0600(&path, h.serialize().as_bytes())?;
     println!("dsctl: duress verifier written to {path} (hash only; the code is not stored).");
     Ok(())
+}
+
+fn enrollment_policy(args: &[String]) -> Result<ds_core::Policy> {
+    let mut policy = ds_core::Policy::default();
+    let mut seen = BTreeSet::new();
+    let mut options = args.iter().skip(1);
+    while let Some(name) = options.next() {
+        if !seen.insert(name) { bail!("duplicate policy option {name}"); }
+        let value = options.next().with_context(|| format!("missing value for {name}"))?;
+        match name.as_str() {
+            "--lockout-at" => policy.lockout_at = value.parse().context("invalid --lockout-at")?,
+            "--wipe-at" => policy.wipe_at = value.parse().context("invalid --wipe-at")?,
+            "--lockout-delay" => policy.lockout_delay = value.parse().context("invalid --lockout-delay")?,
+            "--max-prompts" => policy.max_prompts = value.parse().context("invalid --max-prompts")?,
+            _ => bail!("unknown set-duress option {name}"),
+        }
+    }
+    if !seen.iter().any(|s| s.as_str() == "--max-prompts") {
+        policy.max_prompts = policy.max_prompts.max(policy.wipe_at);
+    }
+    policy.validate()
 }
 
 /// Verify a candidate code against the stored verifier (constant-time). For a self-check that the
@@ -492,7 +847,8 @@ fn verify(arg: Option<&str>) -> Result<()> {
         .context("no duress verifier enrolled (run `dsctl set-duress`)")?;
     let h = DuressHash::parse(&stored)?;
     let cand = match arg {
-        Some(s) => s.as_bytes().to_vec(),
+        Some(s) if ds_core::test_mode() => s.as_bytes().to_vec(),
+        Some(_) => bail!("passing a secret on argv is disabled; run dsctl verify and enter it at the no-echo prompt"),
         None => read_secret("Code to check: ")?,
     };
     let ok = h.verify(&cand)?;
@@ -504,12 +860,17 @@ fn verify(arg: Option<&str>) -> Result<()> {
 
 fn status() -> Result<()> {
     let enrolled = Path::new(&ds_core::duress_hash_path()).exists();
-    let armed = std::fs::read_to_string(SYSTEM_AUTH).map(|c| c.contains(ARM_MARKER)).unwrap_or(false);
+    let pam_armed = std::fs::read_to_string(SYSTEM_AUTH).map(|c| c.contains(ARM_MARKER)).unwrap_or(false);
+    let local_armed = Path::new(ds_core::ARMED_MARKER).is_file();
+    let esp_armed = Path::new(ds_core::ESP_STATE_DIR).join("armed").is_file();
+    let armed = pam_armed && local_armed && esp_armed;
+    let inconsistent = pam_armed || local_armed || esp_armed;
     let recov = std::fs::read_to_string(format!("{}/recovery.device", ds_core::state_dir())).ok();
-    let marker = Path::new(DISPOSABLE_MARKER).exists();
+    let marker = Path::new(ds_core::DISPOSABLE_MARKER).exists();
     println!("status");
     println!("  duress code enrolled : {}", yesno(enrolled));
     println!("  armed (in auth path) : {}", yesno(armed));
+    if inconsistent && !armed { println!("  integrity             : INCONSISTENT ARMED STATE — recover/disarm before boot"); }
     println!("  recovery keyslot     : {}", recov.as_deref().map(|d| format!("enrolled on {}", d.trim())).unwrap_or_else(|| "none".into()));
     println!("  environment          : {}", if marker { "disposable (destructive ops permitted)" } else { "not marked disposable (destructive ops refused)" });
     Ok(())
@@ -518,8 +879,8 @@ fn status() -> Result<()> {
 /// Destructive and system-altering operations run only on a machine marked disposable while they are
 /// under development.
 fn guard_disposable(op: &str) -> Result<()> {
-    if !Path::new(DISPOSABLE_MARKER).exists() {
-        bail!("SAFETY GUARD: `{op}` refused. This machine is not marked disposable ({DISPOSABLE_MARKER} absent).");
+    if !Path::new(ds_core::DISPOSABLE_MARKER).exists() {
+        bail!("SAFETY GUARD: `{op}` refused. This machine is not marked disposable ({} absent).", ds_core::DISPOSABLE_MARKER);
     }
     Ok(())
 }
@@ -534,25 +895,82 @@ fn require_root() -> Result<()> {
     Ok(())
 }
 fn ensure_state_dir() -> Result<()> {
-    std::fs::create_dir_all(ds_core::STATE_DIR).context("create state dir")?;
-    let _ = std::process::Command::new("chmod").args(["700", ds_core::STATE_DIR]).status();
+    let dir = ds_core::state_dir();
+    std::fs::create_dir_all(&dir).context("create state dir")?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).context("chmod state dir")?;
     Ok(())
 }
 fn write_0600(path: &str, data: &[u8]) -> Result<()> {
-    std::fs::write(path, data).with_context(|| format!("write {path}"))?;
-    let _ = std::process::Command::new("chmod").args(["600", path]).status();
-    Ok(())
+    ds_core::atomic_write(Path::new(path), data, 0o600)
 }
 fn read_secret(prompt: &str) -> Result<Vec<u8>> {
-    // reads a line without echo suppression for now; terminal no-echo (termios) is planned.
-    // kept minimal and dependency-free.
-    print!("{prompt}"); std::io::stdout().flush().ok();
-    let mut s = String::new();
-    std::io::stdin().read_line(&mut s).context("read code")?;
-    Ok(s.trim_end_matches(['\n', '\r']).as_bytes().to_vec())
+    if !std::io::stdin().is_terminal() {
+        let mut secret = String::new();
+        std::io::stdin().read_line(&mut secret).context("read piped secret")?;
+        return Ok(secret.trim_end_matches(['\n', '\r']).as_bytes().to_vec());
+    }
+    let secret = rpassword::prompt_password(prompt).context("read secret without echo")?;
+    Ok(secret.into_bytes())
 }
 fn yesno(b: bool) -> &'static str { if b { "yes" } else { "no" } }
 
 // tiny helper so we can scrub a Vec without importing the trait everywhere.
 trait ZeroizeNow { fn zeroize_now(&mut self); }
 impl ZeroizeNow for Vec<u8> { fn zeroize_now(&mut self) { use zeroize::Zeroize; self.zeroize(); } }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ARCH_SYSTEM_AUTH: &str = r#"#%PAM-1.0
+auth       required                    pam_faillock.so      preauth
+-auth      [success=2 default=ignore]  pam_systemd_home.so
+auth       [success=1 default=bad]     pam_unix.so          try_first_pass nullok
+auth       [default=die]               pam_faillock.so      authfail
+auth       optional                    pam_permit.so
+auth       required                    pam_env.so
+auth       required                    pam_faillock.so      authsucc
+account    required                    pam_unix.so
+"#;
+
+    #[test]
+    fn arch_pam_transform_preserves_success_jump_targets() {
+        let out = arm_pam_stack(ARCH_SYSTEM_AUTH).unwrap();
+        assert!(out.contains("[success=3 default=ignore]  pam_systemd_home.so"));
+        assert!(out.contains("[success=2 default=bad]     pam_unix.so"));
+        assert_eq!(out.matches("pam_ds.so").count(), 3);
+        let fail = out.find("pam_ds.so authfail").unwrap();
+        let stock_fail = out.find("pam_faillock.so      authfail").unwrap();
+        assert!(fail < stock_fail);
+        let stock_succ = out.find("pam_faillock.so      authsucc").unwrap();
+        let success = out.find("pam_ds.so authsucc").unwrap();
+        assert!(success > stock_succ);
+    }
+
+    #[test]
+    fn refuses_unknown_pam_layout() {
+        assert!(arm_pam_stack("auth required pam_unix.so\n").is_err());
+    }
+
+    #[test]
+    fn installer_policy_options_are_applied_or_rejected() {
+        let parse = |values: &[&str]| enrollment_policy(&values.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let policy = parse(&["set-duress", "--lockout-at", "4", "--wipe-at", "8"]).unwrap();
+        assert_eq!(policy.lockout_at, 4);
+        assert_eq!(policy.wipe_at, 8);
+        assert_eq!(policy.max_prompts, 8);
+        assert!(parse(&["set-duress", "--wipe-at"]).is_err());
+        assert!(parse(&["set-duress", "--wipe-at", "21"]).is_err());
+        assert!(parse(&["set-duress", "--unknown", "1"]).is_err());
+        assert!(parse(&["set-duress", "--wipe-at", "6", "--wipe-at", "7"]).is_err());
+    }
+
+    #[test]
+    fn disarm_removes_only_the_hook_token() {
+        let input = "MODULES=()\nHOOKS=(base udev deathstroke encrypt filesystems)\n";
+        let (out, changed) = without_deathstroke_hook(input).unwrap();
+        assert!(changed);
+        assert_eq!(out, "MODULES=()\nHOOKS=(base udev encrypt filesystems)\n");
+        assert!(without_deathstroke_hook("HOOKS=(base mydeathstroke encrypt)\n").is_err());
+    }
+}

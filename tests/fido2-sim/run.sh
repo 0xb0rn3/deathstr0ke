@@ -5,13 +5,25 @@
 set -u
 P(){ echo "  PASS  $*"; }; F(){ echo "  FAIL  $*"; FAILED=1; }; FAILED=0
 DSCTL=${DSCTL:-/tmp/dsctl}
-export DS_STATE_DIR=/tmp/ds-fido2-state
+export DS_STATE_DIR=/tmp/ds-fido2-state.$$
+export DS_TEST_MODE=1
 rm -rf "$DS_STATE_DIR"; mkdir -p "$DS_STATE_DIR"
-# the guard reads the real path, so mark disposable there
-install -d -m700 /etc/arxos/deathstroke 2>/dev/null
-touch /etc/arxos/deathstroke/DISPOSABLE_MACHINE_OK_TO_DESTROY
+# the guard reads the real path, so create its marker only if this test owns it.
+MARKER=/etc/arxos/deathstroke/DISPOSABLE_MACHINE_OK_TO_DESTROY
+made_marker=0
+LOOP=""
+W=/tmp/ds-fido2.$$
+cleanup(){
+  [ -n "$LOOP" ] && losetup -d "$LOOP" 2>/dev/null || true
+  rm -rf "$W" "$DS_STATE_DIR"
+  if [ "$made_marker" = 1 ]; then rm -f "$MARKER"; fi
+  return 0
+}
+trap cleanup EXIT
+mkdir -p /etc/arxos/deathstroke
+if [ ! -e "$MARKER" ]; then touch "$MARKER"; made_marker=1; fi
 
-W=/tmp/ds-fido2; rm -rf "$W"; mkdir -p "$W"
+mkdir -p "$W"
 printf 'daily-pass' > "$W/pw"
 dd if=/dev/zero of="$W/vault.img" bs=1M count=32 status=none
 LOOP=$(losetup -f --show "$W/vault.img")
@@ -37,6 +49,6 @@ printf 'wrong-secret-000000000000000000' > "$W/bad"
 cryptsetup open --test-passphrase --key-file "$W/bad" "$LOOP" 2>/dev/null \
   && F "a wrong secret opened it (should not)" || P "wrong secret correctly rejected"
 
-losetup -d "$LOOP" 2>/dev/null; rm -rf "$W" "$DS_STATE_DIR"
 echo
 [ $FAILED -eq 0 ] && echo "FIDO2-SIM: ALL PASS" || echo "FIDO2-SIM: FAILURES ABOVE"
+exit "$FAILED"

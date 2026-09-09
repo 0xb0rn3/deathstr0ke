@@ -7,3 +7,5 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 ds-core = { path = "../ds-core" }
+serde.workspace = true
+serde_json.workspace = true

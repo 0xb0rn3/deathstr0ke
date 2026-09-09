@@ -22,11 +22,6 @@ $S install -d -m755 -o root -g root /usr/lib/arxos/deathstroke   # where the bin
 # config-schema reference. Not an active config: armed is false and nothing reads it yet.
 $S install -Dm600 "$HERE/deathstroke.conf.example" /etc/arxos/deathstroke/deathstroke.conf.example
 
-# the resume unit template, shipped with a .disabled suffix so systemd does not pick it up. `dsctl
-# arm` installs the real unit and enables it; this stages the template only.
-$S install -Dm644 "$HERE/deathstroke-resume.service.disabled" \
-   /usr/lib/arxos/deathstroke/deathstroke-resume.service.disabled
-
 # a state marker so dsctl can detect the layout is present, and so the state is auditable.
 $S install -Dm644 /dev/stdin /var/lib/arxos/deathstroke/STATE <<'EOF'
 state = inert

@@ -1,6 +1,6 @@
-# Dormant template. Not enabled by default; `dsctl arm` enables it when the dead-man switch is armed.
-# Periodically runs the dead-man check so an isolated (offline/airplane-mode) machine still wipes if
-# the user never checks in. Pairs with deathstroke-deadman.service.
+# Dormant packaging template. It is not installed or enabled by `dsctl arm`; packaging must opt in.
+# Periodically runs the dead-man check so an isolated (offline/airplane-mode) machine still destroys
+# its recorded daily slot if the user never checks in. Pairs with deathstroke-deadman.service.
 [Unit]
 Description=DEATHSTROKE dead-man check
 
