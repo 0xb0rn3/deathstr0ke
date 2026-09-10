@@ -317,9 +317,20 @@ fn active_keyslots(device: &str) -> Result<BTreeSet<u8>> {
     let mut slots = BTreeSet::new();
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         let trimmed = line.trim_start();
+        // LUKS2: keyslots are listed as "<n>: luks2".
         if let Some((number, kind)) = trimmed.split_once(':') {
             if kind.trim_start().starts_with("luks2") {
-                if let Ok(slot) = number.parse::<u8>() { slots.insert(slot); }
+                if let Ok(slot) = number.trim().parse::<u8>() { slots.insert(slot); }
+                continue;
+            }
+        }
+        // LUKS1: keyslots are listed as "Key Slot <n>: ENABLED" (installers still produce LUKS1,
+        // e.g. Calamares' default). A DEATHSTROKE toolkit must not fail to arm a valid LUKS1 disk.
+        if let Some(rest) = trimmed.strip_prefix("Key Slot ") {
+            if let Some((number, state)) = rest.split_once(':') {
+                if state.trim().eq_ignore_ascii_case("ENABLED") {
+                    if let Ok(slot) = number.trim().parse::<u8>() { slots.insert(slot); }
+                }
             }
         }
     }

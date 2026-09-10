@@ -23,7 +23,9 @@ printf 'daily-test-key' > "$WORK/daily"
 printf 'offline-recovery-test-key' > "$WORK/recovery"
 dd if=/dev/zero of="$WORK/vault.img" bs=1M count=32 status=none
 loop=$(losetup -f --show "$WORK/vault.img")
-cryptsetup luksFormat --type luks2 --pbkdf pbkdf2 --batch-mode "$loop" "$WORK/daily" >/dev/null
+# LUKS type is parameterized: real installers (Calamares) still produce LUKS1, and enroll-recovery
+# must handle both. Run this test with DS_LUKS_TYPE=luks1 and DS_LUKS_TYPE=luks2.
+cryptsetup luksFormat --type "${DS_LUKS_TYPE:-luks2}" --pbkdf pbkdf2 --batch-mode "$loop" "$WORK/daily" >/dev/null
 
 "$DSCTL" enroll-recovery --device "$loop" \
     --existing-keyfile "$WORK/daily" --new-keyfile "$WORK/recovery"
