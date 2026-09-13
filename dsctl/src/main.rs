@@ -42,7 +42,8 @@ fn run(args: Vec<String>) -> Result<()> {
         Some("deadman-check") => { return deadman_check().map(|c| std::process::exit(c)); }
         Some("arm")        => arm(),
         Some("disarm")     => disarm(),
-        _ => { eprintln!("usage: dsctl set-duress | verify [code] | status | factors | enroll <fido2|tpm2|passphrase> --device <dev> [--pin] | enroll-recovery --device <dev> | arm | disarm"); std::process::exit(2); }
+        Some("panic")      => panic_wipe(),
+        _ => { eprintln!("usage: dsctl set-duress | verify [code] | status | factors | enroll <fido2|tpm2|passphrase> --device <dev> [--pin] | enroll-recovery --device <dev> | arm | disarm | panic"); std::process::exit(2); }
     }
 }
 
@@ -866,6 +867,41 @@ fn verify(arg: Option<&str>) -> Result<()> {
     let mut cand = cand; cand.zeroize_now();
     if ok { println!("dsctl: MATCH — this code is the enrolled duress code."); }
     else   { println!("dsctl: no match."); }
+    Ok(())
+}
+
+/// `dsctl panic`: a deliberate, discoverable duress trigger for a booted+unlocked session, for users
+/// who will not think to type the duress phrase at a password prompt. Requires root, requires the
+/// machine be ARMED, and confirms intent by re-entering the enrolled duress phrase (so it can never
+/// fire by accident). On a correct phrase it runs the SAME recovery-safe crypto-erase that pam_ds and
+/// the dead-man switch use: the daily keyslot is destroyed (the disk passphrase stops working) while
+/// the offline recovery keyslot survives, so the owner can still restore. Refuses on an un-armed
+/// machine (no ARMED marker) and on a wrong phrase.
+fn panic_wipe() -> Result<()> {
+    require_root()?;
+    if !Path::new(ds_core::ARMED_MARKER).exists() {
+        bail!("DEATHSTROKE is not armed on this machine; there is nothing to trigger");
+    }
+    let stored = std::fs::read_to_string(ds_core::duress_hash_path())
+        .context("no duress verifier enrolled (run `dsctl set-duress`)")?;
+    let h = DuressHash::parse(&stored)?;
+    eprintln!("DEATHSTROKE panic: this destroys the daily encryption key right now.");
+    eprintln!("The disk passphrase stops working; your offline recovery key still does.");
+    let mut cand = read_secret("Enter your duress phrase to confirm the wipe: ")?;
+    let ok = h.verify(&cand)?;
+    cand.zeroize_now();
+    if !ok { bail!("phrase does not match the enrolled duress phrase; no action taken"); }
+    let dev = configured_target()
+        .context("no target device recorded (run `dsctl enroll-recovery --device <luks>`)")?;
+    // Test builds may point at a specific ds-erase (same rule as DS_STATE_DIR); release ignores it.
+    let erase = ds_core::test_mode().then(|| std::env::var("DS_ERASE_BIN").ok()).flatten()
+        .or_else(|| ["/usr/lib/arxos/deathstroke/ds-erase", "/usr/local/bin/ds-erase"]
+            .iter().find(|p| Path::new(p).exists()).map(|s| s.to_string()))
+        .unwrap_or_else(|| "ds-erase".to_string());
+    eprintln!("dsctl: firing recovery-safe crypto-erase on {dev} ...");
+    let st = Command::new(erase).args(["--fire", "--device", &dev]).status()
+        .context("spawn ds-erase")?;
+    if !st.success() { bail!("ds-erase did not complete successfully"); }
     Ok(())
 }
 
