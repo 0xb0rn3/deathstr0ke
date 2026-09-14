@@ -37,6 +37,9 @@ fn run(args: Vec<String>) -> Result<i32> {
 
     if !esp.is_dir() { bail!("armed ESP state directory missing: {}", esp.display()); }
     if !esp.join("armed").is_file() { bail!("armed ESP marker missing"); }
+    // Tamper check: the writable ESP verifier/policy must match the copies frozen into the initramfs at
+    // arm time. This fails closed if an attacker edited only the plaintext ESP (see verify_against_baked).
+    verify_against_baked(&esp)?;
     let cfg = read_cfg(&esp)?;
     let duress = load_duress(&esp)?;
     let daily_slot = read_daily_slot(&esp)?;
@@ -114,6 +117,32 @@ fn read_cfg(esp: &Path) -> Result<ds_core::Policy> {
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("read armed policy {}", path.display()))?;
     ds_core::Policy::parse(&text).context("invalid armed policy")
+}
+
+/// Cross-check the writable ESP verifier + policy against the copies frozen into the initramfs at arm
+/// time (`/etc/arxos/deathstroke/{duress.hash,config}.trusted`, baked by the mkinitcpio install hook).
+/// The ESP is a plaintext FAT partition an offline attacker can edit; these baked references live in the
+/// initramfs rootfs, so if the two disagree the ESP was tampered with and we FAIL CLOSED rather than
+/// honour an attacker-supplied verifier/policy. Bypassing this requires modifying the initramfs itself
+/// (closed by a signed UKI + Secure Boot). The reboot-persistent counter is deliberately NOT covered
+/// here (it must stay writable); a TPM NV counter is the separate fix for counter rollback. If a baked
+/// reference is absent (an initramfs armed before this change) the pair is skipped for backward
+/// compatibility; a current `dsctl arm` always bakes both.
+fn verify_against_baked(esp: &Path) -> Result<()> {
+    let baked_dir = Path::new(ds_core::CONFIG_DIR);
+    for (live, trusted) in [("duress.hash", "duress.hash.trusted"), ("config", "config.trusted")] {
+        let bpath = baked_dir.join(trusted);
+        if !bpath.is_file() { continue; } // no frozen reference (pre-change arm): nothing to compare
+        let baked = std::fs::read_to_string(&bpath)
+            .with_context(|| format!("read baked reference {}", bpath.display()))?;
+        let onesp = std::fs::read_to_string(esp.join(live))
+            .with_context(|| format!("read ESP {live}"))?;
+        if baked.trim() != onesp.trim() {
+            bail!("ESP {live} does not match the initramfs-baked reference: pre-boot state was tampered \
+                   with. Refusing to unlock. Boot from recovery media and re-arm if this was intentional.");
+        }
+    }
+    Ok(())
 }
 fn load_duress(esp: &Path) -> Result<ds_core::DuressHash> {
     let path = esp.join("duress.hash");

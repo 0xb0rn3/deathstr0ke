@@ -43,6 +43,20 @@ build() {
     add_file /etc/arxos/deathstroke/ARMED
     add_file /etc/arxos/deathstroke/DISPOSABLE_MACHINE_OK_TO_DESTROY
 
+    # Bake the duress verifier + policy as TRUSTED reference copies frozen into the initramfs. The live
+    # copies on the ESP are writable (FAT, plaintext), so an attacker who images the disk could swap the
+    # verifier or widen the policy (e.g. raise wipe_at) with a plain file edit. ds-unlock cross-checks the
+    # ESP copies against these frozen references at boot and FAILS CLOSED on any mismatch, so ESP-only
+    # tampering is detected: defeating it requires modifying this initramfs too (close that with a signed
+    # UKI + Secure Boot). The reboot-persistent COUNTER stays ESP-only, since it must remain writable.
+    if [ -f /boot/efi/deathstroke/duress.hash ] && [ -f /boot/efi/deathstroke/config ]; then
+        add_file /boot/efi/deathstroke/duress.hash /etc/arxos/deathstroke/duress.hash.trusted 600
+        add_file /boot/efi/deathstroke/config /etc/arxos/deathstroke/config.trusted 600
+    else
+        error "deathstroke armed but the ESP duress.hash/config are not present to bake as trusted references"
+        return 1
+    fi
+
     add_runscript
 }
 
