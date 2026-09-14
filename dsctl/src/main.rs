@@ -118,8 +118,12 @@ fn enroll_factor(args: &[String]) -> Result<()> {
     ce.push(device.clone());
     println!("dsctl: enrolling {kind}{} on {device} (passphrase slot is kept)",
              if pin { " + PIN" } else { "" });
-    let st = Command::new(&ce[0]).args(&ce[1..]).status().context("systemd-cryptenroll")?;
-    if !st.success() { bail!("enroll {kind} failed"); }
+    // record the slot this factor adds so `arm` recognizes it as intended (not a backdoor slot).
+    record_added_slots(&device, || {
+        let st = Command::new(&ce[0]).args(&ce[1..]).status().context("systemd-cryptenroll")?;
+        if !st.success() { bail!("enroll {kind} failed"); }
+        Ok(())
+    })?;
     // record the factor as enabled (metadata only; no secret).
     ensure_state_dir()?;
     ds_core::atomic_write(&Path::new(&ds_core::state_dir()).join(format!("factor.{kind}")), b"enrolled\n", 0o600)?;
@@ -148,8 +152,12 @@ fn enroll_fido2_simulated(device: &str, existing_keyfile: Option<String>) -> Res
 
     let mut a = vec!["luksAddKey".to_string(), device.to_string(), keyfile.clone()];
     if let Some(ek) = existing_keyfile { a.push("--key-file".into()); a.push(ek); }
-    let st = Command::new("cryptsetup").args(&a).status().context("cryptsetup luksAddKey (sim)")?;
-    if !st.success() { bail!("simulated fido2 luksAddKey failed"); }
+    // record the slot this simulated factor adds so `arm` recognizes it as intended.
+    record_added_slots(device, || {
+        let st = Command::new("cryptsetup").args(&a).status().context("cryptsetup luksAddKey (sim)")?;
+        if !st.success() { bail!("simulated fido2 luksAddKey failed"); }
+        Ok(())
+    })?;
     ds_core::atomic_write(Path::new(&format!("{dir}/factor.fido2")), b"enrolled (simulated)\n", 0o600)?;
     println!("dsctl: fido2 (SIMULATED) enrolled on {device}. The token secret now unlocks a keyslot.");
     println!("       (physical USB handshake unproven in sim; verify with a real key or the VM USB-HID sim.)");
@@ -205,8 +213,12 @@ fn seal_tpm(args: &[String]) -> Result<()> {
     if let Some(pk) = flag(args, "--public-key") { ce.push(format!("--tpm2-public-key={pk}")); }
     ce.push(device.clone());
     println!("dsctl: sealing a keyslot to the TPM on {device} (PCRs {pcrs}{})", if with_pin { ", PIN" } else { "" });
-    let st = Command::new(&ce[0]).args(&ce[1..]).status().context("systemd-cryptenroll tpm2")?;
-    if !st.success() { bail!("TPM seal failed"); }
+    // record the TPM keyslot so `arm` recognizes it as intended (not a backdoor slot).
+    record_added_slots(&device, || {
+        let st = Command::new(&ce[0]).args(&ce[1..]).status().context("systemd-cryptenroll tpm2")?;
+        if !st.success() { bail!("tpm2 seal failed"); }
+        Ok(())
+    })?;
     ensure_state_dir()?;
     ds_core::atomic_write(&Path::new(&ds_core::state_dir()).join("factor.tpm2"), format!("sealed pcrs={pcrs}\n").as_bytes(), 0o600)?;
     println!("dsctl: TPM measured-boot seal enrolled. The disk now unlocks only on this unmodified boot chain.");
@@ -352,6 +364,53 @@ fn matching_keyslots(device: &str, keyfile: &str) -> Result<Vec<u8>> {
     Ok(matches)
 }
 
+// ---- known-keyslot registry (arm-time backdoor-slot defense) ----
+//
+// The recovery-preserving trigger destroys ONLY the recorded daily.slot; every other active keyslot
+// survives. So an UNRECORDED active keyslot (one a coercer/evil-maid pre-enrolled, or a botched install
+// left) would remain a working decryption path after a duress wipe. To close that, dsctl records every
+// keyslot it enrolls in `known.slots`, and `arm` refuses if the device carries any active slot that is
+// not recorded. This is a fail-closed audit, not destruction: it makes an unaudited slot BLOCK arming
+// rather than silently ride along.
+fn known_slots_path() -> PathBuf { PathBuf::from(ds_core::state_dir()).join("known.slots") }
+
+fn read_known_slots() -> BTreeSet<u8> {
+    let mut s = BTreeSet::new();
+    if let Ok(c) = std::fs::read_to_string(known_slots_path()) {
+        for tok in c.split(|ch: char| ch == ',' || ch.is_whitespace()) {
+            if let Ok(n) = tok.trim().parse::<u8>() { s.insert(n); }
+        }
+    }
+    s
+}
+
+fn write_known_slots(slots: &BTreeSet<u8>) -> Result<()> {
+    ensure_state_dir()?;
+    let body = slots.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",");
+    ds_core::atomic_write(&known_slots_path(), format!("{body}\n").as_bytes(), 0o600)
+}
+
+/// Add newly-enrolled slots to the registry (union). Best-effort: a registry-write failure must not
+/// leave a slot silently unrecorded, so callers surface the error.
+fn add_known_slots(new: &BTreeSet<u8>) -> Result<()> {
+    if new.is_empty() { return Ok(()); }
+    let mut s = read_known_slots();
+    s.extend(new.iter().copied());
+    write_known_slots(&s)
+}
+
+/// Run `op` (which enrolls a keyslot on `device`) and record whatever slot(s) it added into the
+/// registry, so a later `arm` recognizes them as intended rather than treating them as backdoor slots.
+fn record_added_slots<F: FnOnce() -> Result<()>>(device: &str, op: F) -> Result<()> {
+    let before = active_keyslots(device).unwrap_or_default();
+    op()?;
+    if let Ok(after) = active_keyslots(device) {
+        let added: BTreeSet<u8> = after.difference(&before).copied().collect();
+        add_known_slots(&added)?;
+    }
+    Ok(())
+}
+
 // ---- offline hardening: strong LUKS KDF + anti-forensic posture (DEATHSTROKE.md §12.2/§10.1) ----
 //
 // This is the layer that actually resists an OFFLINE attacker (who images the disk and never runs our
@@ -453,6 +512,19 @@ fn enroll_recovery(args: &[String]) -> Result<()> {
     ds_core::atomic_write(&dir.join("target.device"), format!("{device}\n").as_bytes(), 0o600)?;
     ds_core::atomic_write(&dir.join("daily.slot"), format!("{}\n", daily_matches[0]).as_bytes(), 0o600)?;
     ds_core::atomic_write(&dir.join("recovery.slot"), format!("{}\n", added[0]).as_bytes(), 0o600)?;
+    // Baseline the known-slot registry to exactly {daily, recovery}. enroll-recovery is the foundational
+    // step, so this establishes the audited set; later factor enrollments add to it, and `arm` refuses any
+    // active slot not in it. `after` is the full active set right now, so anything beyond daily+recovery is
+    // a pre-existing extra slot the operator must resolve before arming (we do NOT silently trust it).
+    let mut baseline = BTreeSet::new();
+    baseline.insert(daily_matches[0]);
+    baseline.insert(added[0]);
+    write_known_slots(&baseline)?;
+    let extras: Vec<u8> = after.difference(&baseline).copied().collect();
+    if !extras.is_empty() {
+        println!("dsctl: NOTE: {extras:?} are active but not daily/recovery; `arm` will refuse until you \
+                  remove them (cryptsetup luksKillSlot) or enroll intended factors via dsctl.");
+    }
     println!("dsctl: recovery slot {} verified on {device}; protected daily slot {} recorded.", added[0], daily_matches[0]);
     Ok(())
 }
@@ -475,6 +547,26 @@ fn arm() -> Result<()> {
     let slots = active_keyslots(&target)?;
     if !slots.contains(&daily_slot) || !slots.contains(&recovery_slot) {
         bail!("recorded daily/recovery slots are not both active");
+    }
+    // Backdoor-slot defense: the duress trigger destroys ONLY the daily slot and keeps recovery, so any
+    // OTHER active keyslot would survive a wipe as a decryption path. Refuse to arm unless every active
+    // slot was recorded by dsctl (enroll-recovery baselines daily+recovery; factor enrollments add
+    // theirs). An unrecorded active slot => stop, so a pre-enrolled/leftover slot cannot ride along.
+    let mut known = read_known_slots();
+    if !known.contains(&daily_slot) || !known.contains(&recovery_slot) {
+        // registry missing or inconsistent (e.g. armed by an older dsctl): rebuild the baseline we can
+        // vouch for from the recorded slots, then enforce against it.
+        known.insert(daily_slot);
+        known.insert(recovery_slot);
+        write_known_slots(&known)?;
+    }
+    let unknown: Vec<u8> = slots.difference(&known).copied().collect();
+    if !unknown.is_empty() {
+        bail!("refusing to arm: keyslot(s) {unknown:?} on {target} are active but NOT recorded by dsctl. \
+               A duress/dead-man wipe destroys only the daily slot, so an unrecorded slot would survive as \
+               a decryption path. Inspect with `cryptsetup luksDump {target}`; remove an unwanted slot with \
+               `cryptsetup luksKillSlot {target} <n>`, or re-enroll an intended factor via `dsctl enroll` so \
+               it is recorded, then arm again.");
     }
     let content = std::fs::read_to_string(SYSTEM_AUTH).with_context(|| format!("read {SYSTEM_AUTH}"))?;
     let local_marker = Path::new(ds_core::ARMED_MARKER).is_file();
@@ -968,6 +1060,36 @@ impl ZeroizeNow for Vec<u8> { fn zeroize_now(&mut self) { use zeroize::Zeroize; 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The arm-time backdoor-slot defense: the known-slot registry round-trips, and the set-difference
+    // that `arm` uses flags exactly the active slots that were never recorded by dsctl.
+    #[test]
+    fn known_slot_registry_flags_unrecorded_slots() {
+        // state_dir() only honors DS_STATE_DIR when DS_TEST_MODE=1 and the path is under /tmp.
+        let dir = std::path::Path::new("/tmp").join(format!("ds-known-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("DS_TEST_MODE", "1");
+        std::env::set_var("DS_STATE_DIR", dir.to_str().unwrap());
+        // enroll-recovery baselines exactly {daily=0, recovery=1}
+        let mut baseline = BTreeSet::new();
+        baseline.insert(0u8); baseline.insert(1u8);
+        write_known_slots(&baseline).unwrap();
+        assert_eq!(read_known_slots(), baseline, "registry must round-trip");
+        // a factor enrollment records its slot (2); now {0,1,2} are all known
+        let mut factor = BTreeSet::new(); factor.insert(2u8);
+        add_known_slots(&factor).unwrap();
+        assert_eq!(read_known_slots(), BTreeSet::from([0u8, 1, 2]));
+        // an out-of-band slot (3) that dsctl never recorded is the one `arm` must refuse
+        let active = BTreeSet::from([0u8, 1, 2, 3]);
+        let unknown: Vec<u8> = active.difference(&read_known_slots()).copied().collect();
+        assert_eq!(unknown, vec![3u8], "only the unrecorded slot is flagged");
+        // with no stray slot, nothing is flagged
+        let clean = BTreeSet::from([0u8, 1, 2]);
+        assert!(clean.difference(&read_known_slots()).copied().collect::<Vec<u8>>().is_empty());
+        std::env::remove_var("DS_STATE_DIR");
+        std::env::remove_var("DS_TEST_MODE");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     const ARCH_SYSTEM_AUTH: &str = r#"#%PAM-1.0
 auth       required                    pam_faillock.so      preauth
