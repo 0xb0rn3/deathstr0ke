@@ -643,7 +643,43 @@ fn arm() -> Result<()> {
         return Err(e).context("arm transaction rolled back");
     }
     println!("dsctl: armed. Recovery/daily slots, PAM, ESP state, and initramfs are verified.");
+    // Additive boot-integrity layer: re-seal the signed UKI over the freshly-rebuilt initramfs. Runs
+    // AFTER the arm transaction has committed, so a missing sealer/Secure-Boot toolchain only warns —
+    // it can never roll back a good arm.
+    reseal_boot_best_effort();
     Ok(())
+}
+
+/// After arm rebuilds the initramfs, re-seal the signed UKI so the regenerated initramfs (carrying the
+/// baked duress verifier + slot records) is covered by the machine Secure Boot signature. Red-team
+/// T3/T7: `/boot` is unencrypted, so a stripped-hook initramfs would otherwise boot the stock `encrypt`
+/// hook with the duress prompt inert; under ENFORCING Secure Boot a tampered initramfs fails the
+/// signature check and will not boot. Best-effort: ds-seal-boot / systemd-ukify / sbsigntools may be
+/// absent on a base install and the arm is already committed, so an unavailable sealer only warns.
+fn reseal_boot_best_effort() {
+    let sealer = if Path::new("/usr/lib/arxos/deathstroke/ds-seal-boot").is_file() {
+        "/usr/lib/arxos/deathstroke/ds-seal-boot"
+    } else if Path::new("/usr/local/bin/ds-seal-boot").is_file() {
+        "/usr/local/bin/ds-seal-boot"
+    } else {
+        "ds-seal-boot"
+    };
+    if Command::new("ukify").arg("--version").output().map_or(true, |o| !o.status.success()) {
+        println!(
+            "dsctl: boot-integrity sealing skipped (systemd-ukify absent). Install systemd-ukify + \
+             sbsigntools, enroll Secure Boot, then run `ds-seal-boot` to bind the signed initramfs \
+             (closes the stripped-hook pre-boot bypass, red-team T3/T7)."
+        );
+        return;
+    }
+    match Command::new(sealer).arg("--reseal-only").status() {
+        Ok(s) if s.success() =>
+            println!("dsctl: signed UKI re-sealed (regenerated initramfs is covered by the Secure Boot signature)."),
+        Ok(s) =>
+            println!("dsctl: WARNING ds-seal-boot exited {s}; the signed UKI may be stale. Re-run `ds-seal-boot` manually."),
+        Err(e) =>
+            println!("dsctl: boot-integrity sealing skipped (ds-seal-boot not runnable: {e}). Run it manually to seal."),
+    }
 }
 
 /// Disarm: restore the exact PAM backup, remove both armed markers, and rebuild initramfs so the

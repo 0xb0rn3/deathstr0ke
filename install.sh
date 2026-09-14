@@ -34,6 +34,13 @@ echo ">> installing mkinitcpio hook (inactive until listed in HOOKS before encry
 $S install -Dm644 "$HERE/mkinitcpio/install/deathstroke" /etc/initcpio/install/deathstroke
 $S install -Dm755 "$HERE/mkinitcpio/hooks/deathstroke"   /etc/initcpio/hooks/deathstroke
 
+# boot-integrity sealer (signed UKI over the armed initramfs). Inert until run: it does nothing to a
+# machine that is not armed, and `dsctl arm` invokes it best-effort only when systemd-ukify is present.
+# dsctl resolves it at /usr/lib/arxos/deathstroke/ds-seal-boot first, so install it there.
+echo ">> installing boot-integrity sealer (inert until armed + Secure Boot enrolled)"
+$S install -Dm755 "$HERE/ds-seal-boot.sh" /usr/lib/arxos/deathstroke/ds-seal-boot
+$S ln -sf /usr/lib/arxos/deathstroke/ds-seal-boot /usr/local/bin/ds-seal-boot
+
 # reserve the inert state layout (dirs, config schema, disabled resume-unit template)
 echo ">> reserving inert layout"
 $S bash "$HERE/scaffold/install.sh"
