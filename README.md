@@ -31,9 +31,9 @@ the same daily-slot destruction policy. The actor then attempts to quiesce netwo
 terminate the active seat, close the configured mapping, and force poweroff.
 
 The crypto path runs on stock `cryptsetup` (`luksKillSlot`, with explicit opt-in
-`luksErase`), so there is
-no patched crypto to carry across upstream releases. The whole toolkit, including the
-PAM module, is written in Rust.
+`luksErase`), so there is no patched crypto to carry across upstream releases, and it reads
+both LUKS2 and LUKS1 keyslot layouts (installers such as Calamares still produce LUKS1). The
+whole toolkit, including the PAM module, is written in Rust.
 
 ## TPM measured-boot seal
 
@@ -126,15 +126,17 @@ everything stays inert until `dsctl arm`.
 
 ## Verification status
 
-2026-09-09 checkpoint: the previous throwaway run observed 13 unit tests, a
-debug build, and 9 unlock self-checks passing. A later regression sequence was
-interrupted; its final result is unknown and its temporary logs did not survive
-shutdown. These observations do not establish installed-system safety or release
-readiness. No destructive tests were resumed in this continuation.
+2026-09-14 checkpoint: the full debug suite (recovery-slot under both LUKS2 and LUKS1,
+fido2-sim, attempt-limit, panic, duress-e2e) passed 6/6 inside the disposable arxos-bootgate
+VM. That run found and fixed a real cross-format defect: the erase engine read LUKS2 keyslots
+only, so on a LUKS1 container the recovery-preserving trigger fail-safe-refused. ds-erase now
+uses the same dual-format keyslot reader as dsctl. These are isolated /tmp loopback plus PAM
+integration tests; they do not by themselves establish installed-system safety or release
+readiness.
 
-Run all tests inside the designated disposable throwaway VM. Do not run this test
-suite on the development host. The latest recovery-slot validation, disarm rollback,
-and installer policy changes supersede earlier passing results.
+Run all tests inside the designated disposable throwaway VM. Do not run this suite on the
+development host (its kernel has no loop driver). The 2026-09-14 recovery-slot validation,
+disarm rollback, and installer policy changes supersede earlier passing results.
 
 The source-level hardening and safe loopback/PAM tests are implemented. Release remains
 blocked until the rebuilt ArxOS ISO passes a fresh encrypted Calamares install with a new
