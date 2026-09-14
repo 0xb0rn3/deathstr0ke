@@ -119,8 +119,10 @@ fn read_cfg(esp: &Path) -> Result<ds_core::Policy> {
     ds_core::Policy::parse(&text).context("invalid armed policy")
 }
 
-/// Cross-check the writable ESP verifier + policy against the copies frozen into the initramfs at arm
-/// time (`/etc/arxos/deathstroke/{duress.hash,config}.trusted`, baked by the mkinitcpio install hook).
+/// Cross-check the writable ESP verifier, policy, and daily/recovery slot records against the copies
+/// frozen into the initramfs at arm time (`/etc/arxos/deathstroke/{duress.hash,config,daily.slot,
+/// recovery.slot}.trusted`, baked by the mkinitcpio install hook). Swapping daily.slot/recovery.slot on
+/// the ESP would otherwise make a duress trigger destroy the real recovery slot and keep the real daily.
 /// The ESP is a plaintext FAT partition an offline attacker can edit; these baked references live in the
 /// initramfs rootfs, so if the two disagree the ESP was tampered with and we FAIL CLOSED rather than
 /// honour an attacker-supplied verifier/policy. Bypassing this requires modifying the initramfs itself
@@ -130,7 +132,8 @@ fn read_cfg(esp: &Path) -> Result<ds_core::Policy> {
 /// compatibility; a current `dsctl arm` always bakes both.
 fn verify_against_baked(esp: &Path) -> Result<()> {
     let baked_dir = Path::new(ds_core::CONFIG_DIR);
-    for (live, trusted) in [("duress.hash", "duress.hash.trusted"), ("config", "config.trusted")] {
+    for (live, trusted) in [("duress.hash", "duress.hash.trusted"), ("config", "config.trusted"),
+                            ("daily.slot", "daily.slot.trusted"), ("recovery.slot", "recovery.slot.trusted")] {
         let bpath = baked_dir.join(trusted);
         if !bpath.is_file() { continue; } // no frozen reference (pre-change arm): nothing to compare
         let baked = std::fs::read_to_string(&bpath)
