@@ -77,14 +77,37 @@ fn luks_erase(device: &str) -> Result<()> {
     Ok(())
 }
 
-/// Count active LUKS2 keyslots (0 after a successful erase).
-fn active_keyslots(device: &str) -> Result<usize> {
+/// Active LUKS keyslots, handling BOTH LUKS2 ("<n>: luks2") and LUKS1 ("Key Slot <n>: ENABLED").
+/// Installers still produce LUKS1 (Calamares' default), so the erase engine must read both formats or
+/// it will misjudge a LUKS1 container as having zero slots and skip/refuse a real erase.
+fn active_slot_set(device: &str) -> Result<std::collections::BTreeSet<u8>> {
     let out = Command::new("cryptsetup").args(["luksDump", device]).output().context("cryptsetup luksDump")?;
     if !out.status.success() { bail!("luksDump failed on {device}"); }
-    Ok(String::from_utf8_lossy(&out.stdout).lines().filter(|l| {
-        let t = l.trim_start();
-        t.starts_with(|c: char| c.is_ascii_digit()) && t.contains(": luks2")
-    }).count())
+    let mut slots = std::collections::BTreeSet::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let trimmed = line.trim_start();
+        // LUKS2: keyslots are listed as "<n>: luks2".
+        if let Some((number, kind)) = trimmed.split_once(':') {
+            if kind.trim_start().starts_with("luks2") {
+                if let Ok(slot) = number.trim().parse::<u8>() { slots.insert(slot); }
+                continue;
+            }
+        }
+        // LUKS1: keyslots are listed as "Key Slot <n>: ENABLED".
+        if let Some(rest) = trimmed.strip_prefix("Key Slot ") {
+            if let Some((number, state)) = rest.split_once(':') {
+                if state.trim().eq_ignore_ascii_case("ENABLED") {
+                    if let Ok(slot) = number.trim().parse::<u8>() { slots.insert(slot); }
+                }
+            }
+        }
+    }
+    Ok(slots)
+}
+
+/// Count active LUKS keyslots (0 after a successful erase).
+fn active_keyslots(device: &str) -> Result<usize> {
+    Ok(active_slot_set(device)?.len())
 }
 
 // ---- in-progress journal (the power-loss resume flag) ----
@@ -506,10 +529,7 @@ fn validate_map_name(map: &str) -> Result<()> {
     Ok(())
 }
 fn keyslot_active(device: &str, slot: u8) -> Result<bool> {
-    let out = Command::new("cryptsetup").args(["luksDump", device]).output().context("cryptsetup luksDump")?;
-    if !out.status.success() { bail!("luksDump failed on {device}"); }
-    let prefix = format!("  {slot}: luks2");
-    Ok(String::from_utf8_lossy(&out.stdout).lines().any(|line| line.starts_with(&prefix)))
+    Ok(active_slot_set(device)?.contains(&slot))
 }
 fn verify_keyslot_outcome(journal: &Journal) -> Result<()> {
     match journal.mode {
