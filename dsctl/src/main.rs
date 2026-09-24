@@ -89,6 +89,7 @@ fn factors() -> Result<()> {
 /// passphrase slot -- the knowledge fallback must always remain, so the user can never be bricked.
 fn enroll_factor(args: &[String]) -> Result<()> {
     require_root()?;
+    experimental_banner();
     guard_disposable("enroll")?;
     let device = flag(args, "--device").context("enroll needs --device <luks-dev>")?;
     let kind = args.get(1).map(String::as_str).unwrap_or("");
@@ -488,6 +489,7 @@ fn harden(args: &[String]) -> Result<()> {
 /// runs only where marked disposable while under development.
 fn enroll_recovery(args: &[String]) -> Result<()> {
     require_root()?;
+    experimental_banner();
     guard_disposable("enroll-recovery")?;
     if Path::new(ds_core::ARMED_MARKER).exists() { bail!("disarm before changing recovery slots"); }
     let device = flag(args, "--device").context("enroll-recovery needs --device <luks-dev>")?;
@@ -939,6 +941,7 @@ fn remove_if_exists(path: &Path) -> Result<()> {
 /// plaintext code is scrubbed from memory immediately after derivation (zeroize). Non-destructive.
 fn set_duress(args: &[String]) -> Result<()> {
     require_root()?;
+    experimental_banner();
     if Path::new(ds_core::ARMED_MARKER).exists() { bail!("disarm before changing the duress verifier"); }
     let policy = enrollment_policy(args)?;
     let mut code = read_secret("Duress code: ")?;
