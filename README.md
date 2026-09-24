@@ -6,6 +6,17 @@
 
 **Recovery-preserving duress keyslot destruction for encrypted Linux systems.**
 
+</div>
+
+> ## EXTREMELY EXPERIMENTAL BUILD STILL IN ACTIVE BUILD PHASE, PROCEED WITH UTMOST CAUTION!
+>
+> deathstr0ke destroys encryption keyslots. It is under active development and has not been
+> through independent audit. A misfire or a mistaken duress phrase erases the disk permanently.
+> Only run it on a machine whose data you are prepared to lose.
+
+<div align="center">
+
+
 Rust · LUKS keyslot destruction · PAM duress code · TPM measured-boot seal · fail-closed
 
 <sub>Every destructive path stays inert until you run <code>dsctl arm</code>; <code>dsctl disarm</code> re-engages the guard.</sub>

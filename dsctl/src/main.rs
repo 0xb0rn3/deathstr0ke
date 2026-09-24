@@ -43,8 +43,15 @@ fn run(args: Vec<String>) -> Result<()> {
         Some("arm")        => arm(),
         Some("disarm")     => disarm(),
         Some("panic")      => panic_wipe(),
-        _ => { eprintln!("usage: dsctl set-duress | verify [code] | status | factors | enroll <fido2|tpm2|passphrase> --device <dev> [--pin] | enroll-recovery --device <dev> | arm | disarm | panic"); std::process::exit(2); }
+        _ => { experimental_banner(); eprintln!("usage: dsctl set-duress | verify [code] | status | factors | enroll <fido2|tpm2|passphrase> --device <dev> [--pin] | enroll-recovery --device <dev> | arm | disarm | panic"); std::process::exit(2); }
     }
+}
+
+// 0xb0rn3, 2026-09-24: DEATHSTROKE is branded experimental wherever a user meets it.
+const EXPERIMENTAL: &str =
+    "EXTREMELY EXPERIMENTAL BUILD STILL IN ACTIVE BUILD PHASE, PROCEED WITH UTMOST CAUTION!";
+fn experimental_banner() {
+    eprintln!("\n  !! {EXPERIMENTAL} !!\n");
 }
 
 // Where PAM finds the module. Boot resume is handled inside the initramfs, where the ESP exists
@@ -533,6 +540,7 @@ fn enroll_recovery(args: &[String]) -> Result<()> {
 /// initramfs can all be proven. Any failure restores the original PAM file and removes armed markers.
 fn arm() -> Result<()> {
     require_root()?;
+    experimental_banner();
     guard_disposable("arm")?;
     if !Path::new(PAM_MODULE).exists() { bail!("{PAM_MODULE} not deployed"); }
     let verifier = std::fs::read_to_string(ds_core::duress_hash_path()).context("read duress verifier")?;
@@ -1013,6 +1021,7 @@ fn panic_wipe() -> Result<()> {
     let stored = std::fs::read_to_string(ds_core::duress_hash_path())
         .context("no duress verifier enrolled (run `dsctl set-duress`)")?;
     let h = DuressHash::parse(&stored)?;
+    experimental_banner();
     eprintln!("DEATHSTROKE panic: this destroys the daily encryption key right now.");
     eprintln!("The disk passphrase stops working; your offline recovery key still does.");
     let mut cand = read_secret("Enter your duress phrase to confirm the wipe: ")?;
@@ -1043,6 +1052,7 @@ fn status() -> Result<()> {
     let recov = std::fs::read_to_string(format!("{}/recovery.device", ds_core::state_dir())).ok();
     let marker = Path::new(ds_core::DISPOSABLE_MARKER).exists();
     println!("status");
+    println!("  {EXPERIMENTAL}");
     println!("  duress code enrolled : {}", yesno(enrolled));
     println!("  armed (in auth path) : {}", yesno(armed));
     if inconsistent && !armed { println!("  integrity             : INCONSISTENT ARMED STATE — recover/disarm before boot"); }
