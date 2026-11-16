@@ -1,0 +1,10 @@
+# Dependabot proposes updates as pull requests; nothing merges by itself. Each one is
+# reviewed and tested like any other change before it is merged.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directories:
+      - "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
